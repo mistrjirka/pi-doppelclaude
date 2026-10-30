@@ -622,7 +622,10 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     // The pi stream outlives the respawn and the retry re-claims it; left attached it would
     // read as a live stream overwritten before its terminal event.
     c.currentResponse = null;
-    discardQuery(c, `dead query retry: ${message}`, disposition);
+    // A dead transport does not imply a corrupt mirrored transcript. Preserve it
+    // for the retry so tool results can be appended without rewriting the prefix.
+    // Invalid-resume handling separately invalidates an unusable mirror.
+    discardQuery(c, `dead query retry: ${message}`, c.doppel.session ? "rebuild" : disposition);
     retry();
     return true;
   }

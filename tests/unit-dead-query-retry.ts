@@ -17,11 +17,13 @@ import {
   type SimpleStreamOptions,
   type Tool,
 } from "@earendil-works/pi-ai";
+import { createSession } from "cc-session-io";
 import {
   type BridgeExecutionObservation,
   createBridgeRuntime as createCoreBridgeRuntime,
 } from "doppelclaude/bridge-runtime";
 import { PushQueue } from "doppelclaude/query-state";
+import { BridgeSessionStore } from "doppelclaude/session-store";
 import { projectCatalogModels } from "pi-doppelclaude/models";
 import { createPiBridgeRuntime as createBridgeRuntime } from "pi-doppelclaude/pi-runtime";
 import { Type } from "typebox";
@@ -73,8 +75,10 @@ interface SpawnedQuery {
 
 function makeHarness(scripts: QueryScript[]) {
   const spawned: SpawnedQuery[] = [];
+  const store = new BridgeSessionStore();
   const runtime = createBridgeRuntime({
     providerSettings: { systemPromptMode: "claude-code" },
+    sessionStore: store,
     queryFactory: (request) => {
       const script = scripts[spawned.length];
       assert.ok(script, `unexpected query spawn #${spawned.length + 1}`);
@@ -127,7 +131,7 @@ function makeHarness(scripts: QueryScript[]) {
     },
   });
   void runtime.designateHost(HOST_SESSION);
-  return { runtime, spawned };
+  return { runtime, spawned, store };
 }
 
 function stream(
@@ -457,6 +461,43 @@ describe("dead query retry", () => {
       1,
       "pi saw the continuation start twice",
     );
+  });
+
+  it("retains the exact cached prefix on dead SDK tool-result retry", async () => {
+    const { runtime, spawned, store } = makeHarness([
+      { stayOpen: true, messages: toolCallEvents() },
+      { stayOpen: true },
+    ]);
+    const continuation = await deliverToolResult(runtime);
+    const mirrored = createSession({ projectPath: process.cwd() });
+    mirrored.addUserMessage("go");
+    mirrored.addAttachment({ type: "environment", snapshot: { workingDirectory: process.cwd() } });
+    mirrored.addAssistantMessage([
+      {
+        type: "tool_use",
+        id: TOOL_CALL_ID,
+        name: "mcp__custom-tools__bash",
+        input: { command: "ls" },
+      },
+    ]);
+    store.replace(mirrored.sessionId, mirrored.records);
+    const original = store.load(mirrored.sessionId);
+    runtime.test.setHostSession({ sessionId: mirrored.sessionId, cursor: 3 });
+
+    spawned[0].fail(QUERY_CLOSED);
+    await until(() => spawned[1]?.prompts.length === 1, "the continuation retry");
+    const recovered = store.load(mirrored.sessionId);
+    assert.deepEqual(recovered?.slice(0, original?.length), original);
+    assert.equal(recovered?.length, (original?.length ?? 0) + 1);
+    const last = recovered?.at(-1)?.message as {
+      content?: Array<{ type: string; tool_use_id?: string }>;
+    };
+    assert.equal(last.content?.[0]?.type, "tool_result");
+    assert.equal(last.content?.[0]?.tool_use_id, TOOL_CALL_ID);
+
+    spawned[1].emit([...textEvents("a.txt"), successResult]);
+    await continuation.done;
+    assert.deepEqual(texts(continuation.events), ["a.txt"]);
   });
 
   it("carries steering forward when the query dies holding it", async () => {
