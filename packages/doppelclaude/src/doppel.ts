@@ -15,9 +15,11 @@ import type { MessageParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resou
 import {
   type ContentBlock,
   createSession,
+  getSessionPath,
   type ImportAttachment,
+  type JsonlRecord,
   repairToolPairing,
-  type Session,
+  Session,
 } from "cc-session-io";
 import { debug } from "./debug.js";
 import { QueryContext } from "./query-state.js";
@@ -274,6 +276,67 @@ function diagnose(priorMessages: MessageParam[], currentSession: SessionState | 
   return { kind: "missed-messages", missed: missed.length };
 }
 
+/**
+ * A dead MCP continuation may leave Claude Code's mirror ending at the assistant's
+ * tool_use, while pi already holds its matching tool_result. Importing the entire
+ * conversation again can discard cached thinking and context attachments. Append
+ * only the missing result to the exact mirrored prefix when we can prove it matches.
+ *
+ * Restrict this to a dead-query replay: compaction, steering and a genuine history
+ * rewrite must still take the full (safe) rebuild path.
+ */
+function appendRecoveredToolResults(
+  source: readonly SessionStoreEntry[],
+  messages: readonly MessageParam[],
+  sessionId: string,
+  cwd: string,
+): SessionStoreEntry[] | null {
+  const last = messages.at(-1);
+  const assistant = messages.at(-2);
+  if (
+    last?.role !== "user" ||
+    !Array.isArray(last.content) ||
+    !last.content.length ||
+    last.content.some((part) => part.type !== "tool_result") ||
+    assistant?.role !== "assistant" ||
+    !Array.isArray(assistant.content)
+  )
+    return null;
+  const sourceLast = [...source]
+    .reverse()
+    .find((item) => item.type === "user" || item.type === "assistant");
+  if (sourceLast?.type !== "assistant") return null;
+  const sourceContent = (sourceLast.message as { content?: unknown }).content;
+  if (!Array.isArray(sourceContent)) return null;
+  const calls = assistant.content.filter((part) => part.type === "tool_use");
+  const mirrored = sourceContent.filter((part) => part.type === "tool_use");
+  if (!calls.length || calls.length !== mirrored.length) return null;
+  const callIds = new Set(calls.map((part) => part.id));
+  const results = last.content as ToolResultBlockParam[];
+  if (
+    callIds.size !== calls.length ||
+    calls.some(
+      (part, index) => part.id !== mirrored[index].id || part.name !== mirrored[index].name,
+    ) ||
+    results.length !== calls.length ||
+    results.some((part) => !callIds.has(part.tool_use_id))
+  )
+    return null;
+
+  // Preserve the SDK's real UUID chain, signed thinking and all attachments.
+  // The new tool-result message is the only record we synthesize.
+  const session = new Session({
+    sessionId,
+    projectPath: cwd,
+    jsonlPath: getSessionPath(sessionId, cwd),
+    records: source as JsonlRecord[],
+  });
+  session.addUserMessage(
+    results as Parameters<Session["addUserMessage"]>[0] & ToolResultBlockParam[],
+  );
+  return session.records as SessionStoreEntry[];
+}
+
 /** Apply a plan to its doppel: the session it resumes from, and the transcript the store holds. */
 export function applySessionSync(input: {
   doppel: Doppel;
@@ -312,6 +375,42 @@ export function applySessionSync(input: {
   const ownTranscript = previousSessionId ? sessionStore.load(previousSessionId) : null;
   const siblingTranscript = previousSessionId ? null : (input.siblingTranscript?.() ?? null);
   const source = ownTranscript ?? siblingTranscript;
+  if (
+    ownTranscript &&
+    previousSessionId &&
+    plan.reason.kind === "forced" &&
+    plan.reason.cause.startsWith("force-close:dead query retry:")
+  ) {
+    const recovered = appendRecoveredToolResults(
+      ownTranscript,
+      plan.priorMessages,
+      previousSessionId,
+      cwd,
+    );
+    if (recovered) {
+      sessionStore.replace(previousSessionId, recovered);
+      doppel.session = { sessionId: previousSessionId, cursor: plan.priorMessages.length };
+      debug(
+        `syncResult: path=rebuild doppel=${doppel.label} reason=${why} ` +
+          `cache-preserving tool-result append, kept=${ownTranscript.length} records`,
+      );
+      return {
+        sessionId: previousSessionId,
+        path: "rebuild",
+        rebuild: {
+          contextSource: "own",
+          contextAttachments: 0,
+          emptyToolResults: 0,
+          sanitizedToolIds: 0,
+          synthesizedToolResults: 0,
+          droppedToolResults: 0,
+          turnBoundaries: 0,
+          skippedTurnBoundaries: 0,
+          divergence: transcriptDivergence(ownTranscript, recovered),
+        },
+      };
+    }
+  }
   const session = createSession({
     projectPath: cwd,
     ...(previousSessionId ? { sessionId: previousSessionId } : {}),
