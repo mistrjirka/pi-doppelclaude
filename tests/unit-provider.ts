@@ -172,7 +172,7 @@ describe("ambient Claude Code auth", () => {
     assert.equal(probes, 0);
   });
 
-  it("probes only when the catalog asks and reports Claude Code's login remedy", async () => {
+  it("rechecks failed authentication and recovers after Claude Code logs back in", async () => {
     let probes = 0;
     let snapshot = availableAccount;
     const provider = providerWith(undefined, async () => {
@@ -187,20 +187,42 @@ describe("ambient Claude Code auth", () => {
     snapshot = unavailableAccount;
     await provider.refreshModels(refreshContext(true));
     assert.equal(probes, 1);
-    const loginRemedy = {
-      message:
-        "Claude Code is not authenticated. Run `claude auth login`, then restart pi or open `/model` to refresh authentication.",
-    };
-    await assert.rejects(apiKey.check(authInput), loginRemedy);
-    await assert.rejects(apiKey.resolve(authInput), loginRemedy);
-
-    snapshot = availableAccount;
-    await provider.refreshModels(refreshContext(true));
-    assert.equal(probes, 2);
-    assert.deepEqual(await apiKey.check(authInput), {
-      type: "oauth",
-      source: "Claude Code",
+    await assert.rejects(apiKey.check(authInput), {
+      message: "Claude Code is not authenticated. Run `claude auth login`, then retry the request.",
     });
+    assert.equal(probes, 2);
+
+    // Auth changes outside Pi do not require a Pi restart or a catalog refresh.
+    snapshot = availableAccount;
+    assert.deepEqual(await apiKey.resolve(authInput), { auth: {}, source: "Claude Code" });
+    assert.equal(probes, 3);
+    assert.deepEqual(await apiKey.check(authInput), { type: "oauth", source: "Claude Code" });
+    assert.equal(probes, 3);
+  });
+
+  it("shares the recovery probe across simultaneous auth checks", async () => {
+    let probes = 0;
+    let finishProbe: (snapshot: AccountSnapshot) => void = () => {};
+    const provider = providerWith(undefined, () => {
+      probes++;
+      if (probes === 1) return Promise.resolve(unavailableAccount);
+      return new Promise<AccountSnapshot>((resolve) => {
+        finishProbe = resolve;
+      });
+    });
+    const apiKey = required(provider.auth.apiKey, "ambient apiKey auth");
+    await provider.refreshModels(refreshContext(true));
+    assert.equal(probes, 1);
+
+    const checks = Promise.all([apiKey.check(authInput), apiKey.resolve(authInput)]);
+    await Promise.resolve();
+    assert.equal(probes, 2);
+    finishProbe(availableAccount);
+    assert.deepEqual(await checks, [
+      { type: "oauth", source: "Claude Code" },
+      { auth: {}, source: "Claude Code" },
+    ]);
+    assert.equal(probes, 2);
   });
 
   it("surfaces probe failure to Pi's refresh instead of swallowing it", async () => {

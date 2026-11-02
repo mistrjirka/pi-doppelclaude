@@ -64,26 +64,28 @@ export function createAnthropicAgentSdkProvider(
   };
 
   // Claude Code authenticates its own subprocess, so the bridge holds no credential to validate.
-  // Ambient auth stands until a completed probe reports the account logged out. Once it does,
-  // reject with Claude Code's remedy instead of letting Pi misdiagnose the empty ambient credential
-  // as a missing Doppelclaude API key.
-  const requireAuthentication = () => {
-    if (lastSnapshot?.available === false) {
+  // Successful/unknown ambient auth does not require an account probe for every request.
+  // A negative model-discovery probe can become stale after `claude auth login`, however:
+  // recheck it when Pi next asks for auth rather than rejecting forever until `/model` refreshes.
+  const requireAuthentication = async () => {
+    if (lastSnapshot?.available !== false) return;
+    const snapshot = await probeAccount();
+    if (!snapshot.available) {
       throw new Error(
-        "Claude Code is not authenticated. Run `claude auth login`, then restart pi or open `/model` to refresh authentication.",
+        "Claude Code is not authenticated. Run `claude auth login`, then retry the request.",
       );
     }
   };
   // Reported as OAuth so Pi labels list-price usage as a subscription's; the subscription gate
   // is the account probe's first-party check, not a credential Pi holds.
   const check = async () => {
-    requireAuthentication();
+    await requireAuthentication();
     return { type: "oauth" as const, source: "Claude Code" };
   };
   const loginRemedy = () =>
     new Error("Claude Code manages its own login: run `claude auth login`, then restart pi.");
   const resolve = async () => {
-    requireAuthentication();
+    await requireAuthentication();
     return { auth: {}, source: "Claude Code" };
   };
 
