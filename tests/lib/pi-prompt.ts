@@ -11,6 +11,11 @@ export const PI_IDENTITY =
 
 export const PI_DOCS_HEADING =
   "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):";
+export const PI_1_5_IDENTITY =
+  "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+
+export const PI_1_5_DOCS_HEADING =
+  "Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):";
 
 export function piSystemMessage(toolLines = "- read: read a file"): SystemMessage {
   return {

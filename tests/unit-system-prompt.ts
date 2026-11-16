@@ -3,7 +3,13 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import type { SystemMessage } from "@earendil-works/pi-ai";
 import { buildClaudeSystemPrompt, rewritePiSystemPrompt } from "pi-doppelclaude/system-prompt";
-import { PI_DOCS_HEADING, PI_IDENTITY, piSystemMessage } from "./lib/pi-prompt.js";
+import {
+  PI_1_5_DOCS_HEADING,
+  PI_1_5_IDENTITY,
+  PI_DOCS_HEADING,
+  PI_IDENTITY,
+  piSystemMessage,
+} from "./lib/pi-prompt.js";
 
 const SYSTEM_MESSAGE = piSystemMessage();
 
@@ -25,6 +31,42 @@ function renameSection(message: SystemMessage, from: string, to: string): System
 }
 
 describe("rewritePiSystemPrompt", () => {
+  it("rewrites Pi 1.5 identity and documentation without leaking either version", () => {
+    const current: SystemMessage = {
+      ...SYSTEM_MESSAGE,
+      sections: {
+        ...SYSTEM_MESSAGE.sections,
+        preamble: PI_1_5_IDENTITY,
+        docs: (SYSTEM_MESSAGE.sections?.docs ?? "").replace(PI_DOCS_HEADING, PI_1_5_DOCS_HEADING),
+      },
+    };
+    const rewritten = rewritePiSystemPrompt(current, REPLACEMENTS);
+    assert.ok(rewritten.startsWith("Custom identity."));
+    assert.match(rewritten, /Custom tool note\.\n\n<tools>/);
+    assert.match(rewritten, /<docs>\nCustom docs:/);
+    assert.match(rewritten, /- Main documentation: \/opt\/pi\/README\.md/);
+    for (const wording of [PI_IDENTITY, PI_1_5_IDENTITY, PI_DOCS_HEADING, PI_1_5_DOCS_HEADING]) {
+      assert.ok(!rewritten.includes(wording), `Leaked Pi wording: ${wording}`);
+    }
+  });
+
+  it("rejects an unknown Pi documentation heading instead of silently leaking it", () => {
+    const altered: SystemMessage = {
+      ...SYSTEM_MESSAGE,
+      sections: {
+        ...SYSTEM_MESSAGE.sections,
+        docs: (SYSTEM_MESSAGE.sections?.docs ?? "").replace(
+          PI_DOCS_HEADING,
+          "Pi documentation (read only when pi v2 is asked about its SDK):",
+        ),
+      },
+    };
+    assert.throws(
+      () => rewritePiSystemPrompt(altered, REPLACEMENTS),
+      /changed its documentation heading/,
+    );
+  });
+
   it("uses custom documentation prose while preserving discovered paths", () => {
     const rewritten = rewritePiSystemPrompt(SYSTEM_MESSAGE, {
       ...REPLACEMENTS,
