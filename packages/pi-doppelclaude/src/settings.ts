@@ -58,7 +58,7 @@ export interface BridgeSettings {
   };
 }
 
-interface LoadSettingsOptions {
+export interface LoadSettingsOptions {
   agentDir?: string;
   env?: NodeJS.ProcessEnv;
 }
@@ -69,11 +69,11 @@ function formatTypeBoxError(value: unknown, path: string): string {
   return `doppelclaude: invalid settings in ${path}: ${firstError.instancePath || "/"} ${firstError.message}`;
 }
 
-function parseScopedSettings(value: unknown, path: string): BridgeFileSettings {
+function parseScopedSettings(value: unknown, path: string): BridgeFileSettings | undefined {
   if (!Value.Check(ROOT_SETTINGS_SCHEMA, value)) {
     throw new Error(formatTypeBoxError(value, path));
   }
-  return (value as Static<typeof ROOT_SETTINGS_SCHEMA>).doppelclaude ?? {};
+  return (value as Static<typeof ROOT_SETTINGS_SCHEMA>).doppelclaude;
 }
 
 function validateSettings(settings: BridgeFileSettings): void {
@@ -95,7 +95,17 @@ function debugEnabledFromEnvironment(value: string | undefined): boolean | undef
   throw new Error('doppelclaude: DOPPELCLAUDE_DEBUG must be "1" or "0"');
 }
 
-export function loadBridgeSettings(cwd: string, options: LoadSettingsOptions = {}): BridgeSettings {
+export interface BridgeSettingsSource {
+  agentDir: string;
+  env: NodeJS.ProcessEnv;
+  fileSettings: BridgeFileSettings | undefined;
+}
+
+/** Read and validate the global namespace once, preserving whether it was supplied. */
+export function readBridgeSettings(
+  cwd: string,
+  options: LoadSettingsOptions = {},
+): BridgeSettingsSource {
   const agentDir = options.agentDir ?? getAgentDir();
   const env = options.env ?? process.env;
   const globalSettingsPath = join(agentDir, "settings.json");
@@ -108,7 +118,17 @@ export function loadBridgeSettings(cwd: string, options: LoadSettingsOptions = {
     );
   }
 
-  const settings = parseScopedSettings(manager.getGlobalSettings(), globalSettingsPath);
+  return {
+    agentDir,
+    env,
+    fileSettings: parseScopedSettings(manager.getGlobalSettings(), globalSettingsPath),
+  };
+}
+
+/** Resolve a supplied namespace with the existing strict provider requirements. */
+export function resolveBridgeSettings(source: BridgeSettingsSource): BridgeSettings {
+  const { agentDir, env } = source;
+  const settings = source.fileSettings ?? {};
   validateSettings(settings);
 
   return {
@@ -125,4 +145,8 @@ export function loadBridgeSettings(cwd: string, options: LoadSettingsOptions = {
         join(agentDir, "doppelclaude.log"),
     },
   };
+}
+
+export function loadBridgeSettings(cwd: string, options: LoadSettingsOptions = {}): BridgeSettings {
+  return resolveBridgeSettings(readBridgeSettings(cwd, options));
 }

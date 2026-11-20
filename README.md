@@ -54,6 +54,8 @@ Even then, if you try to use the Agent SDK in pi, Anthropic detects pi's system 
 
 Configuration lives under the `doppelclaude` key in pi's global settings at `~/.pi/agent/settings.json`.
 
+If this key is absent, the installed extension stays inactive and shows a startup notice. It does not register a provider, authenticate, or choose prompt or model defaults. Add your configuration, then run `/reload`. A present but incomplete or invalid configuration still reports an error.
+
 ```json
 {
   "doppelclaude": {

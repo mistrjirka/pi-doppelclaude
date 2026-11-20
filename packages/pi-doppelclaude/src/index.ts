@@ -5,6 +5,7 @@ import { configureDebug, debug, moduleInstanceId } from "doppelclaude/debug";
 import { errorMessage } from "doppelclaude/errors";
 import { REFUSAL_CUSTOM_TYPE, type RefusalEntryData } from "doppelclaude/refusal-data";
 import { createDefaultAccountProbe } from "./account-probe.js";
+import { loadActivationSettings } from "./activation-settings.js";
 import { acquireBridgeOwner } from "./bridge-owner.js";
 import { createCompaction } from "./compaction.js";
 import { createBridgeModelCatalog } from "./model-catalog.js";
@@ -16,7 +17,17 @@ import { renderRefusalEntry } from "./refusal.js";
 import { loadBridgeSettings } from "./settings.js";
 
 export default function activate(pi: ExtensionAPI): void {
-  const settings = loadBridgeSettings(process.cwd());
+  const activation = loadActivationSettings(process.cwd());
+  if (activation.status === "inactive") {
+    let notified = false;
+    pi.on("session_start", (_event, ctx) => {
+      if (notified) return;
+      notified = true;
+      ctx.ui.notify(activation.message, "info");
+    });
+    return;
+  }
+  const { settings } = activation;
   configureDebug({
     ...settings.debug,
     diagnosticLogPath: join(getAgentDir(), "doppelclaude-diag.log"),

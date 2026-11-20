@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
@@ -74,6 +74,48 @@ after(() => {
 });
 
 describe("extension activation ownership", () => {
+  it("keeps an unconfigured host inactive and reports how to enable it", async () => {
+    const settingsPath = join(agentDir, "settings.json");
+    const original = readFileSync(settingsPath, "utf8");
+    const debugLogPath = join(agentDir, "inactive-debug.log");
+    const previousDebug = process.env.DOPPELCLAUDE_DEBUG;
+    const previousDebugPath = process.env.DOPPELCLAUDE_DEBUG_PATH;
+    writeFileSync(settingsPath, '{"packages":["pi-doppelclaude"]}\n');
+    process.env.DOPPELCLAUDE_DEBUG = "1";
+    process.env.DOPPELCLAUDE_DEBUG_PATH = debugLogPath;
+    try {
+      const root = fakePi();
+      activate(root.pi);
+      assert.deepEqual(root.providers, []);
+      assert.deepEqual(root.entryRenderers, []);
+      assert.equal(ownerRegistry[OWNER_KEY], undefined);
+      assert.deepEqual([...root.handlers.keys()], ["session_start"]);
+      const notices: { message: string; level: string }[] = [];
+      const context = {
+        ui: { notify: (message: string, level: string) => notices.push({ message, level }) },
+      };
+      await root.handlers.get("session_start")({ type: "session_start", reason: "new" }, context);
+      await root.handlers.get("session_start")(
+        { type: "session_start", reason: "resume" },
+        context,
+      );
+      assert.equal(notices.length, 1);
+      assert.equal(notices[0].level, "info");
+      assert.match(notices[0].message, /installed but inactive/);
+      assert.ok(notices[0].message.includes(settingsPath));
+      assert.match(notices[0].message, /doppelclaude\.provider/);
+      assert.match(notices[0].message, /\/reload/);
+      assert.equal(existsSync(debugLogPath), false);
+      assert.equal(readFileSync(settingsPath, "utf8"), '{"packages":["pi-doppelclaude"]}\n');
+    } finally {
+      writeFileSync(settingsPath, original);
+      if (previousDebug === undefined) delete process.env.DOPPELCLAUDE_DEBUG;
+      else process.env.DOPPELCLAUDE_DEBUG = previousDebug;
+      if (previousDebugPath === undefined) delete process.env.DOPPELCLAUDE_DEBUG_PATH;
+      else process.env.DOPPELCLAUDE_DEBUG_PATH = previousDebugPath;
+    }
+  });
+
   it("registers the provider without any discovery work", () => {
     const root = fakePi();
     activate(root.pi);
