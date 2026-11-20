@@ -52,6 +52,7 @@ import type { RuntimeRequest } from "./runtime-request.js";
 import { sdkChildEnv } from "./sdk-child-env.js";
 import { awaitQueryInitialization, reconcileMcpServers } from "./sdk-signals.js";
 import { BridgeSessionStore, MalformedSessionTranscriptError } from "./session-store.js";
+import { askQuerySideQuestion, type SideQuestionRequest } from "./side-question.js";
 import { MCP_SERVER_NAME } from "./skills.js";
 
 type RuntimeTool = import("@anthropic-ai/sdk/resources/messages/messages").Tool;
@@ -1484,6 +1485,25 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     return stream;
   }
 
+  /** Uses only an existing query's dedicated control channel, never normal turn routing. */
+  async function sideQuestion(request: SideQuestionRequest): Promise<string> {
+    request.signal?.throwIfAborted();
+    const doppel = doppels.all().find((entry) => entry.key === request.conversationKey);
+    const context = doppel?.context;
+    const activeQuery = context?.activeQuery;
+    if (!activeQuery || context.closing || doppel.session?.rebuildReason) {
+      throw new Error(
+        "No live Claude query is available for this conversation. Send a main message first, then retry /btw.",
+      );
+    }
+    if (context.activeModel !== request.model) {
+      throw new Error(
+        "The selected model differs from the live Claude query. Send a main message with this model before /btw.",
+      );
+    }
+    return askQuerySideQuestion(activeQuery, request.question, request.signal);
+  }
+
   // Full session reset for pi lifecycle events (session start/shutdown). Closes every
   // doppel's query — the host's is drained when it is idle, everyone else's abandoned —
   // and drops all session state + the store. The caller (index.ts) owns the
@@ -1571,6 +1591,7 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
   return {
     turn: (request: RuntimeRequest) => run({ ...request, explicitReplay: false }),
     replay: (request: RuntimeRequest) => run({ ...request, explicitReplay: true }),
+    sideQuestion,
     clear,
     closePersistent,
     markRebuild,

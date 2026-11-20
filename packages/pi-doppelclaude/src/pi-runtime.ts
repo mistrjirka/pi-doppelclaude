@@ -16,6 +16,7 @@ import type { BridgeSessionStore } from "doppelclaude/session-store";
 import { convertPiMessages, readPiTranscript } from "./convert.js";
 import type { BridgeModelCatalog } from "./model-catalog.js";
 import { createPiResponseRuntime } from "./pi-response.js";
+import { createPiSideQuestionStream } from "./pi-side-question.js";
 import { applyPayloadHook } from "./provider-payload.js";
 import type { ProviderSettings } from "./settings.js";
 import { planTurn, resolveMcpTools } from "./turn-plan.js";
@@ -123,6 +124,7 @@ export function createPiBridgeRuntime(dependencies: PiBridgeRuntimeDependencies)
   return {
     stream: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
       stream(model, context, options),
+    streamSideQuestion: createPiSideQuestionStream(core.sideQuestion),
     replay: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
       stream(model, context, options, true),
     setHost(next: BridgeHost | null) {

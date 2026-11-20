@@ -26,6 +26,11 @@ interface ProviderDependencies {
     context: TranscriptContext,
     options?: SimpleStreamOptions,
   ): AssistantMessageEventStream;
+  streamSideQuestion?(
+    model: Model<Api>,
+    context: TranscriptContext,
+    options?: SimpleStreamOptions,
+  ): AssistantMessageEventStream;
   accountProbe: AccountProbe;
   modelCatalog?: BridgeModelCatalog;
 }
@@ -38,9 +43,12 @@ function compatibleReasoning(reasoning: unknown): ThinkingLevel | undefined {
     : undefined;
 }
 
-export function createAnthropicAgentSdkProvider(
-  dependencies: ProviderDependencies,
-): Provider<typeof PROVIDER_API> {
+export function createAnthropicAgentSdkProvider(dependencies: ProviderDependencies): Provider<
+  typeof PROVIDER_API
+> & {
+  streamSideQuestion?: ProviderDependencies["streamSideQuestion"];
+  sideQuestionUsesLiveContext?: boolean;
+} {
   const catalog = dependencies.modelCatalog ?? createBridgeModelCatalog();
   let lastSnapshot: AccountSnapshot | undefined;
   let inFlightProbe: Promise<AccountSnapshot> | undefined;
@@ -138,5 +146,16 @@ export function createAnthropicAgentSdkProvider(
       return validatedStream(model, context, normalizedOptions);
     },
     streamSimple: validatedStream,
+    sideQuestionUsesLiveContext: Boolean(dependencies.streamSideQuestion),
+    streamSideQuestion: dependencies.streamSideQuestion
+      ? (model, context, options) => {
+          if (!isSupportedModel(model)) {
+            return lazyStream(model, async () => {
+              throw new Error(unsupportedModelMessage(model));
+            });
+          }
+          return dependencies.streamSideQuestion(model, context, options);
+        }
+      : undefined,
   };
 }

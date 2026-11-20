@@ -216,6 +216,23 @@ The bridge actually disables ALL normal tools to Claude Code, and instead advert
 
 One quirk of that path: Claude Code truncates every MCP tool description to 4096 chars (as of CC 2.1.296), and pi has no cap. So the bridge raises that limit with Claude Code's own `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` (Claude Code 2.1.280 or later; an older `pathToClaudeCodeExecutable` cuts them again), and pi's descriptions reach the model whole.
 
+## Side questions in the PiTTy fork
+
+The fork exposes an optional `streamSideQuestion` provider capability for PiTTy's
+`/btw` extension. It sends the question through the existing Claude query's
+`askSideQuestion` control request. It does not create a normal turn, execute Pi
+tools, append conversation messages, or interrupt the main request.
+
+A live query for the same session and model must exist. After opening an old
+conversation, switching models, or rebuilding context, send a normal message first.
+Unsupported SDKs return a clear error and never fall back to ordinary tool-enabled
+generation. SDK 0.3.310 has the runtime method but no public TypeScript declaration,
+so this adapter checks the capability and validates its reply.
+
+The SDK returns a completed answer without token or cache usage. No live cache
+savings or latency claim is made. Existing Pi installations ignore this optional
+capability and continue using the normal provider path.
+
 ## Debugging
 
 Set `doppelclaude.debug.enabled` to `true`. logs are at `~/.pi/agent/doppelclaude.log`. You can also just set `DOPPELCLAUDE_DEBUG=1` (and `DOPPELCLAUDE_DEBUG_PATH`) for one-time debugging sessions.

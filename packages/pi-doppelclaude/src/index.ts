@@ -47,6 +47,7 @@ export default function activate(pi: ExtensionAPI): void {
     });
     const provider = createAnthropicAgentSdkProvider({
       stream: runtime.stream,
+      streamSideQuestion: runtime.streamSideQuestion,
       accountProbe: createDefaultAccountProbe(providerSettings),
       modelCatalog,
     });
