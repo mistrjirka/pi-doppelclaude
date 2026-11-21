@@ -5,6 +5,7 @@
 // live provider stream — see issue #18) and carries forward file operations from
 // the previous compaction so <read-files>/<modified-files> stay accurate.
 
+import { randomUUID } from "node:crypto";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   type Api,
@@ -25,6 +26,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { debug, makeCliDebugOptions } from "doppelclaude/debug";
 import { errorMessage } from "doppelclaude/errors";
+import { canonicalClaudeModelId } from "doppelclaude/model-id";
 import { sdkChildEnv } from "doppelclaude/sdk-child-env";
 import { logServedContextWindow, resultErrorText } from "doppelclaude/sdk-result";
 import type { SdkUsage } from "doppelclaude/sdk-usage";
@@ -109,6 +111,8 @@ interface CompactionRequest {
   signal: AbortSignal | undefined;
   cwd: string;
   projectTrusted: boolean;
+  /** Reject incomplete summaries when selected as the cache-aware cold fallback. */
+  requireComplete?: boolean;
 }
 
 export function createCompaction(dependencies: CompactionDependencies) {
@@ -120,6 +124,7 @@ export function createCompaction(dependencies: CompactionDependencies) {
     options: SimpleStreamOptions | undefined,
     stream: AssistantMessageEventStream,
     cwd: string,
+    requireComplete: boolean,
   ): Promise<void> {
     let sdkQuery: IsolatedQuery | undefined;
     let wasAborted = false;
@@ -133,7 +138,12 @@ export function createCompaction(dependencies: CompactionDependencies) {
 
     try {
       const transcript = readPiTranscript(context);
-      const promptText = extractIsolatedSummaryPrompt(transcript.messages);
+      const marker = requireComplete ? `<checkpoint-complete-${randomUUID()}>` : undefined;
+      const promptText =
+        extractIsolatedSummaryPrompt(transcript.messages) +
+        (marker
+          ? `\n\nAfter the complete summary, put this exact marker on its own final line:\n${marker}`
+          : "");
       const compactProviderSettings = loadProviderSettings(cwd);
       const compactSystemPromptMode = compactProviderSettings.systemPromptMode;
       const compactSettingSources = settingSourcesFor(compactSystemPromptMode);
@@ -143,11 +153,16 @@ export function createCompaction(dependencies: CompactionDependencies) {
         `compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`,
       );
 
+      const env = sdkChildEnv();
+      delete env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+      if (Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0)
+        env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(model.maxTokens);
+
       sdkQuery = queryFactory({
         prompt: promptText,
         options: {
           cwd,
-          env: sdkChildEnv(),
+          env,
           tools: [],
           strictMcpConfig: true,
           ...(compactSettingSources ? { settingSources: compactSettingSources } : {}),
@@ -160,6 +175,8 @@ export function createCompaction(dependencies: CompactionDependencies) {
           ),
           model: cliModel,
           maxTurns: 1,
+          settings: { disableAllHooks: true },
+          hooks: {},
           ...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
           ...makeCliDebugOptions("compact-summary"),
         },
@@ -174,6 +191,9 @@ export function createCompaction(dependencies: CompactionDependencies) {
       let finalText = "";
       let errorText: string | undefined;
       let terminalUsage: SdkUsage | undefined;
+      let completeTerminal = false;
+      let toolAttempted = false;
+      let servedModel = false;
       let firstEventLogged = false;
 
       for await (const message of sdkQuery) {
@@ -184,15 +204,23 @@ export function createCompaction(dependencies: CompactionDependencies) {
         if (wasAborted) break;
 
         if (message.type === "assistant") {
+          if (requireComplete) {
+            const actual = canonicalClaudeModelId(message.message.model);
+            if (actual !== canonicalClaudeModelId(model.id))
+              errorText = "The summary used a different model.";
+            else servedModel = true;
+          }
           for (const block of message.message?.content ?? []) {
             if (block.type === "text" && typeof block.text === "string")
               assistantText += block.text;
+            if (block.type === "tool_use" || block.type === "server_tool_use") toolAttempted = true;
           }
         } else if (message.type === "result") {
           logServedContextWindow(debug, "compact summary", message, model.contextWindow);
           if (message.subtype === "success") {
             finalText = message.result || assistantText;
             terminalUsage = message.usage;
+            completeTerminal = !message.is_error && message.stop_reason === "end_turn";
           } else {
             errorText =
               resultErrorText(message) ?? `Claude Code summary failed: ${message.subtype}`;
@@ -208,7 +236,25 @@ export function createCompaction(dependencies: CompactionDependencies) {
         return;
       }
 
-      const text = finalText || assistantText;
+      let text = finalText || assistantText;
+      if (requireComplete) {
+        const usageValues = terminalUsage && [
+          terminalUsage.input_tokens,
+          terminalUsage.output_tokens,
+          terminalUsage.cache_read_input_tokens ?? 0,
+          terminalUsage.cache_creation_input_tokens ?? 0,
+        ];
+        if (
+          !completeTerminal ||
+          !servedModel ||
+          toolAttempted ||
+          !marker ||
+          !text.trimEnd().endsWith(marker) ||
+          !usageValues?.every((value) => Number.isFinite(value) && value >= 0)
+        ) {
+          errorText = "The standalone summary is incomplete or unsafe.";
+        } else text = text.trimEnd().slice(0, -marker.length).trim();
+      }
       if (errorText || !text.trim()) {
         const msg = errorText ?? "Claude Code summary returned empty text";
         debug(`compact summary: error ${msg}`);
@@ -261,7 +307,14 @@ export function createCompaction(dependencies: CompactionDependencies) {
       options?: SimpleStreamOptions,
     ): AssistantMessageEventStream => {
       const stream = createAssistantMessageEventStream();
-      void runIsolatedSummary(model, context, options, stream, request.cwd);
+      void runIsolatedSummary(
+        model,
+        context,
+        options,
+        stream,
+        request.cwd,
+        request.requireComplete === true,
+      );
       return stream;
     };
     return compact(

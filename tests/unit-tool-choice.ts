@@ -162,7 +162,14 @@ describe("toolChoice", () => {
     assert.deepEqual(harness.spawned[0].options?.tools, [], "Claude Code's own tools were left on");
     // The runtime owns the child environment for every frontend.
     const env = harness.spawned[0].options?.env;
-    assert.equal(env?.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
+    assert.equal(
+      env?.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+      process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+    );
+    assert.equal(env?.DISABLE_TELEMETRY, "1");
+    assert.equal(env?.DISABLE_ERROR_REPORTING, "1");
+    assert.equal(env?.DISABLE_AUTOUPDATER, "1");
+    assert.equal(env?.CLAUDE_CODE_DISABLE_TERMINAL_TITLE, "1");
     assert.equal(env?.ENABLE_TOOL_SEARCH, "false");
     assert.equal(env?.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH, "1000000");
     assert.equal(env?.CLAUDE_CODE_TOTAL_TOKENS_REMINDER, "off");

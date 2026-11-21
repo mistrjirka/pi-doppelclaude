@@ -1,5 +1,6 @@
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { MessageParam, Tool } from "@anthropic-ai/sdk/resources/messages/messages";
+import type { CacheTiming } from "./cached-compaction.js";
 
 /** Input shared by frontends. Tool definitions use bare MCP names; history uses qualified names. */
 export interface RuntimeRequest {
@@ -40,4 +41,6 @@ export interface RuntimeRequest {
   explicitReplay?: boolean;
   /** Permit the core's one-shot recovery when an SDK query dies before producing output. */
   retryDeadQuery?: boolean;
+  /** Verified cache creation lifetime from this main request, never a maintenance branch. */
+  observeCacheTiming?: (timing: CacheTiming) => void | Promise<void>;
 }

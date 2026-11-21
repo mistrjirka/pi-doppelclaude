@@ -1,12 +1,19 @@
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { type ExtensionAPI, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  getAgentDir,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+import type { ProviderUsageSnapshot } from "doppelclaude/account-usage";
 import { configureDebug, debug, moduleInstanceId } from "doppelclaude/debug";
 import { errorMessage } from "doppelclaude/errors";
 import { REFUSAL_CUSTOM_TYPE, type RefusalEntryData } from "doppelclaude/refusal-data";
 import { createDefaultAccountProbe } from "./account-probe.js";
 import { loadActivationSettings } from "./activation-settings.js";
 import { acquireBridgeOwner } from "./bridge-owner.js";
+import { type CacheAwareCompactionFields, runCacheAwareCompaction } from "./cached-compaction.js";
 import { createCompaction } from "./compaction.js";
 import { createBridgeModelCatalog } from "./model-catalog.js";
 import { PROVIDER_ID } from "./models.js";
@@ -75,8 +82,62 @@ export default function activate(pi: ExtensionAPI): void {
     renderRefusalEntry(entry, { ...options, outputPad: pi.getSettings().outputPad ?? 1 }, theme),
   );
 
+  // Structural registration also loads on older Pi releases, where this event is never emitted.
+  (
+    pi as ExtensionAPI & {
+      on(
+        event: "provider_usage",
+        handler: (
+          event: { provider: string; modelId: string; signal?: AbortSignal },
+          ctx: ExtensionContext,
+        ) => Promise<ProviderUsageSnapshot | undefined>,
+      ): void;
+    }
+  ).on("provider_usage", async (event, ctx) => {
+    if (event.provider !== PROVIDER_ID) return undefined;
+    return runtime.getUsage({
+      conversationKey: ctx.sessionManager.getSessionId(),
+      signal: event.signal,
+    });
+  });
+
   pi.on("session_before_compact", async (event, ctx) => {
     if (ctx.model?.provider !== PROVIDER_ID) return undefined;
+    const currentModel = ctx.model;
+    const cacheEvent = event as typeof event & CacheAwareCompactionFields;
+    if (cacheEvent.method === "extension") return undefined;
+    if (cacheEvent.method === "cache-aware") {
+      try {
+        const result = await runCacheAwareCompaction({
+          event: cacheEvent,
+          model: ctx.model,
+          prepare: (cached) =>
+            runtime.prepareCompaction({
+              sessionId: cached.sessionId,
+              model: cached.model,
+              context: cached.context,
+              customInstructions: event.customInstructions,
+              signal: event.signal,
+            }),
+          standalone: () =>
+            compaction.run({
+              preparation: event.preparation,
+              model: currentModel,
+              branchEntries: event.branchEntries,
+              customInstructions: event.customInstructions,
+              signal: event.signal,
+              cwd: ctx.cwd,
+              projectTrusted: ctx.isProjectTrusted(),
+              requireComplete: true,
+            }),
+        });
+        return result ? { compaction: result } : { cancel: true };
+      } catch (error) {
+        if (!event.signal?.aborted)
+          ctx.ui.notify(`Cached compaction could not finish: ${errorMessage(error)}`, "warning");
+        return { cancel: true };
+      }
+    }
     debug(
       `session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
         `isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
@@ -113,6 +174,7 @@ export default function activate(pi: ExtensionAPI): void {
   pi.on("session_start", async (event, ctx) => {
     runtime.setHost({
       ui: ctx.ui,
+      sessionId: ctx.sessionManager.getSessionId(),
       appendEntry: (customType, data) => pi.appendEntry(customType, data),
     });
     await runtime.designateHost(ctx.sessionManager.getSessionId());

@@ -6,11 +6,14 @@
 //
 // Extracted from index.ts so tests can import without activating the extension.
 
-import type { Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { Options, Query, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type {
   ContentBlock,
   RawMessageStreamEvent,
+  Tool,
 } from "@anthropic-ai/sdk/resources/messages/messages";
+import type { AccountUsage } from "./account-usage.js";
+import type { CachedInput } from "./cached-compaction.js";
 import {
   type CommandUsageObservation,
   type CoreResponseEvent,
@@ -94,6 +97,10 @@ export class QueryContext {
 
   // Query-scoped: reassigned by spawnFreshQuery for every query this context serves.
   activeQuery: Query | null = null;
+  accountUsage: AccountUsage | null = null;
+  queryOptions: Options | null = null;
+  queryTools: Tool[] = [];
+  cachedInput: CachedInput | null = null;
   inputQueue: PushQueue<SDKUserMessage> | null = null;
   sessionStoreWriter: SessionStoreWriter | null = null;
   currentResponse: CoreResponseHandle | null = null;

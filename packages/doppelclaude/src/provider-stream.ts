@@ -56,6 +56,8 @@ export interface QueryConsumerHooks {
   onApiRetry?(message: SDKAPIRetryMessage): void;
   onRefusal?(message: SDKModelRefusalFallbackMessage | SDKModelRefusalNoFallbackMessage): void;
   onCompaction?(message: SDKStatusMessage | SDKCompactBoundaryMessage): void;
+  onInputResponse?(message: SDKAssistantMessage | SDKPartialAssistantMessage): void;
+  onRateLimit?(info: unknown): void;
 }
 
 function parsePartialJson(
@@ -556,6 +558,7 @@ export function createProviderStreamRuntime(dependencies: ProviderStreamDependen
         }
         break;
       case "rate_limit_event": {
+        hooks.onRateLimit?.(message.rate_limit_info);
         const text = formatRateLimitMessage(message.rate_limit_info);
         if (message.rate_limit_info.status === "rejected") {
           c.turnRateLimitRejection = text;
@@ -600,6 +603,8 @@ export function createProviderStreamRuntime(dependencies: ProviderStreamDependen
       dispatchSdkMessage(message, customToolNameToPi, requestedModel, queryCtx, hooks);
     for await (const message of sdkQuery) {
       recordSdkMessage(message);
+      if (message.type === "assistant" || message.type === "stream_event")
+        hooks.onInputResponse?.(message);
       if (queryCtx.rejectionWindowOpen && drivesResponse(message)) {
         queryCtx.bufferedSdkMessages.push(message);
         continue;

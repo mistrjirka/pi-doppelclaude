@@ -1,10 +1,12 @@
 import type { Options, Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type {
-  Api,
-  AssistantMessageEventStream,
-  Model,
-  SimpleStreamOptions,
-  TranscriptContext,
+import {
+  type Api,
+  type AssistantMessageEventStream,
+  type Context,
+  type Model,
+  normalizeContext,
+  type SimpleStreamOptions,
+  type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { createBridgeRuntime } from "doppelclaude/bridge-runtime";
@@ -30,6 +32,7 @@ export interface PiBridgeRuntimeDependencies {
 
 export interface BridgeHost {
   ui: ExtensionUIContext;
+  sessionId?: string;
   appendEntry(customType: string, data: RefusalEntryData): void;
 }
 
@@ -44,6 +47,10 @@ export function createPiBridgeRuntime(dependencies: PiBridgeRuntimeDependencies)
     allowExtraUsage: dependencies.providerSettings.allowExtraUsage,
     notify: (message, level) => host?.ui.notify(message, level),
     refusal: (customType, data) => host?.appendEntry(customType, data),
+    observeUsage: (sessionId, snapshot) => {
+      if (host?.sessionId && host.sessionId !== sessionId) return;
+      host?.ui.setStatus("doppelclaude.usage.v1", JSON.stringify({ ...snapshot, sessionId }));
+    },
     observeServedModel: (id) => dependencies.modelCatalog?.noteServedModel(id),
     observeCommandUsage: (usage) => {
       const model = models.get(usage.requestedModel);
@@ -103,6 +110,8 @@ export function createPiBridgeRuntime(dependencies: PiBridgeRuntimeDependencies)
       options: spawnOptions,
       toolNameToSdk: turnTools.customToolNameToSdk,
       toolNameToClient: turnTools.customToolNameToPi,
+      observeCacheTiming: (timing) =>
+        options?.onProviderStreamEvent?.({ type: "prompt_cache_timing", ...timing }, model),
     };
     const adapter = responses.adapt(model, options?.onResponse, () => hookAbort.abort());
     void (async () => {
@@ -125,6 +134,29 @@ export function createPiBridgeRuntime(dependencies: PiBridgeRuntimeDependencies)
     stream: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
       stream(model, context, options),
     streamSideQuestion: createPiSideQuestionStream(core.sideQuestion),
+    getUsage: core.getUsage,
+    prepareCompaction(request: {
+      sessionId: string;
+      model: Model<Api>;
+      context: Context | TranscriptContext;
+      customInstructions?: string;
+      signal?: AbortSignal;
+    }) {
+      const transcript = readPiTranscript(normalizeContext(request.context));
+      const tools = resolveMcpTools(transcript.tools, undefined);
+      const messages = convertPiMessages(
+        transcript.messages,
+        tools.customToolNameToSdk,
+      ).anthropicMessages;
+      return core.prepareCompaction({
+        conversationKey: request.sessionId,
+        model: request.model.id,
+        messages: messages as RuntimeRequest["messages"],
+        customInstructions: request.customInstructions,
+        maxOutputTokens: request.model.maxTokens,
+        signal: request.signal,
+      });
+    },
     replay: (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) =>
       stream(model, context, options, true),
     setHost(next: BridgeHost | null) {

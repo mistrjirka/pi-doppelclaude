@@ -77,7 +77,7 @@ Configuration lives under the `doppelclaude` key in pi's global settings at `~/.
 - `systemPromptMode` — `"claude-code"` sends only Claude Code's preset (not recommended), `"pi"` sends only the rewritten pi prompt, `"append"` sends Claude Code's preset with the rewritten pi prompt appended. Default `"pi"`.
 - `systemPromptReplacements` — the prose that makes your prompt yours. Required in `"pi"` and `"append"` modes. See [System prompt](#system-prompt).
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Use only when the SDK's binaries can't run on your filesystem for whatever reason.
-- `allowExtraUsage` — when Claude Code reports a turn billed to Extra Usage instead of your plan limits, the turn fails and the conversation stops before Claude Code sends another request. `true` keeps going on Extra Usage. Pi's compaction summary is a single request and is not guarded.
+- `allowExtraUsage` — when Claude Code reports a turn billed to Extra Usage instead of your plan limits, the turn fails and the conversation stops before Claude Code sends another request. `true` keeps going on Extra Usage. Cache-aware summary branches reject reported Extra Usage unless this setting is enabled. The legacy standalone summary is not guarded.
 - `debug.enabled` / `debug.logPath` — see [Debugging](#debugging).
 
 In `"pi"` mode, Claude Code ignores its own settings files — no `~/.claude/settings.json`, no `CLAUDE.md`. pi's `AGENTS.md` and skills are then the only project instructions in play, which is the point of the mode. The other two modes leave Claude Code's settings at its defaults.
@@ -232,6 +232,54 @@ so this adapter checks the capability and validates its reply.
 The SDK returns a completed answer without token or cache usage. No live cache
 savings or latency claim is made. Existing Pi installations ignore this optional
 capability and continue using the normal provider path.
+
+## Usage and compaction in the PiTTy fork
+
+Usage reads use the active Claude subprocess's control channel. They do not send a
+prompt or start a model request. The snapshot identifies that subprocess's account
+and profile, includes its observation time, and keeps unknown values distinct from
+zero. Live rate-limit events refresh the same account's windows. A profile selected
+for a new tab cannot relabel an existing tab's usage.
+
+The SDK can reuse a plan-usage snapshot for up to 60 seconds. New quota-header
+observations invalidate that cache. After an endpoint failure, the SDK can also
+return older seeded data without freshness metadata. `observedAt` records when the
+bridge received the control reply or event, not a guaranteed server measurement
+time. A delayed control reply cannot replace a newer rate-limit event.
+
+Telemetry, error reporting, automatic CLI updates and model-generated native session titles stay disabled. The bridge no
+longer forces `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, because the installed CLI
+also uses it to block quota requests. An explicit caller value remains respected.
+
+When PiTTy selects **Cache-aware**, the bridge prepares a summary in a separate
+native session fork. It keeps the original system prompt, model, tool schemas and
+message prefix. A synthetic assistant boundary exists only in that fork to prevent
+Claude Code from changing the final cached user message while appending the summary
+request. The summary cannot execute tools or change the main transcript. Pi commits
+the checkpoint after the pending tool batch finishes and retains later messages.
+
+The summary uses the registered model's output allowance. It must finish with
+`end_turn` and an explicit completion marker. Truncation, tool attempts, a different
+served model or missing usage evidence fail the compaction. Checkpoint details
+record cache reads, cache writes, input/output tokens and native source identifiers.
+A complete summary remains valid after cache eviction, with `cacheHit: false`.
+
+Proactive compaction requires an observed cache lifetime from a real main response.
+A positive cache read can refresh a previously observed lifetime only inside the
+same live query and unchanged configuration. The bridge does not assume that the
+API catalog's lifetime applies to Claude subscriptions. Without a usable snapshot,
+proactive compaction skips. Manual or context-limit compaction uses an explicitly
+labeled standalone summary subprocess. An invalid summary never triggers a hidden
+second method.
+
+Selecting **Two-model extension** makes this hook yield to that extension. Older Pi
+hosts retain the existing isolated compaction behavior. Native automatic compaction
+stays disabled.
+
+The native wire test uses SDK 0.3.310 and a localhost fixture server. It proves prefix
+preservation, output allowance, command isolation and usage propagation. Its token
+counts are synthetic. Actual Anthropic cache savings still require a credentialed
+measurement.
 
 ## Debugging
 

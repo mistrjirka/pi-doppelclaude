@@ -30,8 +30,15 @@ export function sdkChildEnv(): NodeJS.ProcessEnv {
     // Pi owns the conversation record; a bridge subprocess writing CC auto-memory
     // into ~/.claude from pi turns is state leaking outside that ownership.
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
-    // Also implies DISABLE_TELEMETRY and DISABLE_ERROR_REPORTING.
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    // The CLI's umbrella flag also blocks GET /api/oauth/usage. Keep the privacy
+    // and update controls separate so the requested account meter can refresh.
+    // An explicit caller umbrella flag remains inherited above.
+    DISABLE_TELEMETRY: "1",
+    DISABLE_ERROR_REPORTING: "1",
+    DISABLE_AUTOUPDATER: "1",
+    // Pi owns titles too. Without this, removing the umbrella flag starts an
+    // extra model request solely to name each native session.
+    CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
     // The caller owns its tools; deferring them behind a search tool hides them from the model.
     ENABLE_TOOL_SEARCH: "false",
     // Claude Code cuts MCP tool descriptions at 4096 characters; the caller's tools are its own,

@@ -100,7 +100,8 @@ export function isStableClaudeModelId(id: string): boolean {
 }
 
 function projectModel(canonical: Model<Api>): BridgeModel {
-  const { compat: _canonicalApiCompatibility, ...metadata } = canonical;
+  // The SDK decides the actual lifetime. Canonical Anthropic defaults must not arm Pi timers.
+  const { compat: _canonicalApiCompatibility, promptCache: _catalogCache, ...metadata } = canonical;
   return {
     ...metadata,
     api: PROVIDER_API,

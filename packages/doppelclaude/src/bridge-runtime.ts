@@ -30,6 +30,18 @@ import {
 import { deleteSession } from "cc-session-io";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import {
+  createAccountUsage,
+  type ProviderUsageSnapshot,
+  unavailableUsage,
+  usageProfile,
+} from "./account-usage.js";
+import {
+  CachedInputUnavailableError,
+  type CacheSummaryRequest,
+  observedCacheTiming,
+  summarizeCachedInput,
+} from "./cached-compaction.js";
 import type { CommandUsageObservation, CoreResponseEvent } from "./core-response.js";
 import { isDeadQueryFailure } from "./dead-query.js";
 import { debug, diagDump, makeCliDebugOptions } from "./debug.js";
@@ -65,6 +77,7 @@ export interface BridgeRuntimeDependencies {
   observeServedModel?(id: string): void | Promise<void>;
   observeCommandUsage?(observation: CommandUsageObservation): void;
   observeExecution?(observation: BridgeExecutionObservation): void;
+  observeUsage?(conversationKey: string, snapshot: ProviderUsageSnapshot): void;
   /** Absent means a turn Claude Code reports as billed to Extra Usage fails instead. */
   allowExtraUsage?: boolean;
   /** Another runtime's transcript of the host conversation, for a host rebuild with none of its own. */
@@ -208,6 +221,7 @@ interface FreshQueryRequest extends FreshTurn {
   syncPlan: SyncPlan;
   model: string;
   contextMessageCount: number;
+  mainRequest: RuntimeRequest;
   /** The host's own query survives the turn; every other query is a one-shot. */
   persistent: boolean;
   /** The query being replaced finished cleanly, so it is drained instead of abandoned. */
@@ -513,6 +527,10 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     c.pendingResults.clear();
     clearToolCallTracking(c);
     c.activeQuery = null;
+    c.accountUsage = null;
+    c.cachedInput = null;
+    c.queryOptions = null;
+    c.queryTools = [];
     c.inputQueue = null;
     c.readyForInput = false;
     activeQueryContexts.delete(c);
@@ -697,6 +715,26 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     );
   }
 
+  function rememberInput(context: QueryContext, request: RuntimeRequest): void {
+    if (!context.queryOptions) return;
+    const previous = context.cachedInput;
+    const unchanged =
+      previous?.model === request.model &&
+      JSON.stringify(previous.queryOptions) === JSON.stringify(context.queryOptions) &&
+      JSON.stringify(previous.tools) === JSON.stringify(context.queryTools);
+    context.cachedInput = {
+      ...(unchanged ? { cacheTtlMs: previous.cacheTtlMs } : {}),
+      model: request.model,
+      messages: structuredClone(request.messages),
+      tools: structuredClone(context.queryTools),
+      queryOptions: { ...context.queryOptions, env: { ...context.queryOptions.env } },
+      responseMessageId: null,
+      ...(context.doppel.kind === "host" && context === context.doppel.context
+        ? { observeTiming: request.observeCacheTiming }
+        : {}),
+    };
+  }
+
   async function spawnFreshQuery(request: FreshQueryRequest): Promise<void> {
     const {
       queryCtx,
@@ -762,6 +800,9 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
         `doppel=${doppel.label} resume=${syncResult.sessionId?.slice(0, 8) ?? "none"} effort=${queryOptions.effort ?? "default"} persistent=${persistent}`,
       );
 
+      queryCtx.queryOptions = { ...request.queryOptions, env: { ...request.queryOptions.env } };
+      queryCtx.queryTools = structuredClone(mcpTools);
+      rememberInput(queryCtx, request.mainRequest);
       const sdkQuery = queryFactory({
         prompt: inputQueue,
         options: queryOptions,
@@ -778,10 +819,40 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
         rebuild: syncResult.rebuild,
       });
       queryCtx.activeQuery = sdkQuery;
+      queryCtx.accountUsage = createAccountUsage(sdkQuery, usageProfile(queryOptions.env ?? {}), {
+        isCurrent: () => queryCtx.activeQuery === sdkQuery && !queryCtx.closing,
+        observe: (snapshot) => {
+          if (doppel.kind === "host" && queryCtx === doppel.context)
+            dependencies.observeUsage?.(doppel.key, snapshot);
+        },
+      });
       activeQueryContexts.add(queryCtx);
       attachAbort();
 
       const completion = consumeQuery(sdkQuery, customToolNameToPi, model, queryCtx, {
+        onInputResponse(message) {
+          if (message.parent_tool_use_id || !queryCtx.cachedInput) return;
+          const response =
+            message.type === "assistant"
+              ? message.message
+              : message.event.type === "message_start"
+                ? message.event.message
+                : undefined;
+          if (!response || response.model === "<synthetic>") return;
+          const snapshot = queryCtx.cachedInput;
+          snapshot.responseMessageId = response.id;
+          const timing = observedCacheTiming(response.usage, snapshot.cacheTtlMs);
+          if (timing) snapshot.cacheTtlMs = timing.ttlMs;
+          if (timing && snapshot.observeTiming && snapshot.reportedTtlMs !== timing.ttlMs) {
+            snapshot.reportedTtlMs = timing.ttlMs;
+            try {
+              void Promise.resolve(snapshot.observeTiming(timing)).catch(() => {});
+            } catch {}
+          }
+        },
+        onRateLimit(info) {
+          void queryCtx.accountUsage?.observeRateLimit(info);
+        },
         onCompaction(message) {
           if (message.subtype === "status") {
             dependencies.observeExecution?.({
@@ -1003,6 +1074,7 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     const stream = native;
     const model = request.model;
     const nativeMessages = request.messages;
+    const mainRequest = request;
     const nativeCursor = nativeMessages.length;
     const lastMsg = nativeMessages.at(-1);
     const lastUserBlocks =
@@ -1167,6 +1239,7 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
         syncPlan: request.syncPlan,
         model,
         contextMessageCount: nativeMessages.length,
+        mainRequest,
         persistent: request.persistent,
         drainExisting: request.drainExisting,
         promptMessage: request.promptMessage,
@@ -1196,6 +1269,7 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
       claimCurrentResponse(resultCtx.currentResponse, "tool-result", resultCtx);
       resultCtx.observeCommandUsage = dependencies.observeCommandUsage;
       resultCtx.latestCursor = nativeCursor;
+      rememberInput(resultCtx, request);
       debug(
         `provider: tool results, ${allResults.length} results, ${resultCtx.pendingToolCallCount} waiting handlers, msgs=${nativeMessages.length}`,
       );
@@ -1448,13 +1522,16 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
               );
               queryCtx.mcpSignature = freshTurn.mcpSignature;
               queryCtx.hasMcpServer = freshTurn.mcpTools.length > 0;
+              queryCtx.queryTools = structuredClone(freshTurn.mcpTools);
             }
             if (queryCtx.cliModel !== freshTurn.cliModel) {
               debug(`provider: persistent setModel ${queryCtx.cliModel} → ${freshTurn.cliModel}`);
               await activeQuery.setModel(freshTurn.cliModel);
               queryCtx.cliModel = freshTurn.cliModel;
+              if (queryCtx.queryOptions) queryCtx.queryOptions.model = freshTurn.cliModel;
             }
             await applyOutputCeiling(queryCtx, activeQuery);
+            rememberInput(queryCtx, request);
             inputQueue.push(promptMessage);
             dependencies.observeExecution?.({
               event: "query_reused",
@@ -1483,6 +1560,44 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
 
     beginTurn(0);
     return stream;
+  }
+
+  async function getUsage(request: {
+    conversationKey: string;
+    signal?: AbortSignal;
+  }): Promise<ProviderUsageSnapshot> {
+    const context = doppels.all().find((entry) => entry.key === request.conversationKey)?.context;
+    if (!context?.activeQuery || context.closing || !context.accountUsage)
+      return unavailableUsage();
+    return context.accountUsage.get(request.signal);
+  }
+
+  async function prepareCompaction(request: CacheSummaryRequest) {
+    const doppel = doppels.all().find((entry) => entry.key === request.conversationKey);
+    const context = doppel?.context;
+    const session = doppel?.session;
+    if (
+      !context?.activeQuery ||
+      context.closing ||
+      !context.cachedInput ||
+      !session ||
+      session.rebuildReason
+    ) {
+      throw new CachedInputUnavailableError(
+        "No matching live cached input is available for compaction.",
+      );
+    }
+    const entries = sessionStore.load(session.sessionId);
+    if (!entries)
+      throw new CachedInputUnavailableError("The cached input transcript is unavailable.");
+    return summarizeCachedInput({
+      queryFactory,
+      snapshot: context.cachedInput,
+      request,
+      sourceSessionId: session.sessionId,
+      entries,
+      allowExtraUsage: dependencies.allowExtraUsage,
+    });
   }
 
   /** Uses only an existing query's dedicated control channel, never normal turn routing. */
@@ -1592,6 +1707,8 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     turn: (request: RuntimeRequest) => run({ ...request, explicitReplay: false }),
     replay: (request: RuntimeRequest) => run({ ...request, explicitReplay: true }),
     sideQuestion,
+    getUsage,
+    prepareCompaction,
     clear,
     closePersistent,
     markRebuild,
