@@ -12,7 +12,12 @@ const QUERY_CLOSED = /Query closed before response received/i;
  *  has usually already refreshed successfully, so a subprocess that re-reads the
  *  credential store gets a live token. */
 export function isAuthRevokedFailure(message: string): boolean {
-  return /\b401\b/.test(message) && /oauth/i.test(message) && /revoked|expired/i.test(message);
+  return (
+    /\b401\b|\bfailed to authenticate\b|\bauthentication failed\b/i.test(message) &&
+    /\boauth\b/i.test(message) &&
+    /\btoken\b/i.test(message) &&
+    /\b(?:revoked|expired)\b/i.test(message)
+  );
 }
 
 export function isDeadQueryFailure(message: string): boolean {

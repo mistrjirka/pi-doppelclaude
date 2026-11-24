@@ -370,6 +370,18 @@ describe("dead query retry", () => {
     assert.equal(terminalError(turn.events), null, "a self-healed turn must not report a failure");
   });
 
+  it("recovers when Claude reports OAuth revocation without the HTTP status", async () => {
+    const { runtime, spawned } = makeHarness([
+      { messages: [{ ...revokedResult, error: "Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator." } as SDKMessage] },
+      { messages: [...textEvents("refreshed"), successResult] },
+    ]);
+    const turn = record(stream(runtime, prompt));
+    await turn.done;
+    assert.equal(spawned.length, 2);
+    assert.deepEqual(texts(turn.events), ["refreshed"]);
+    assert.equal(terminalError(turn.events), null);
+  });
+
   it("never replays a turn the user aborted", async () => {
     const controller = new AbortController();
     const { runtime, spawned } = makeHarness([{ stayOpen: true, hangOnInterrupt: true }]);
