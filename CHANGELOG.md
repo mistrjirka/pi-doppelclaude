@@ -2,6 +2,13 @@
 
 # Changelog
 
+## 0.14.17 — 2026-11-25
+
+### Fixed
+
+- Keep consecutive task, steering, and recall messages together as the active SDK prompt. Imported history no longer makes Claude Code close the task before it receives recall context. Preserve structured content and native cursor counts across fresh turns, warm reuse, retries, rebuilds, and resumed children.
+- Preserve steering on one-shot child tool continuations and rich-content replays. Tool results stay in the transcript while every pending user block reaches the active prompt.
+
 ## 0.14.16 — 2026-11-02
 
 ### Added

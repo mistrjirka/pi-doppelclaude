@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,6 +18,10 @@ jobs:
 
   publish-npm:
     name: Publish npm package
+    if: github.repository == 'thurstonsand/pi-doppelclaude'
+    permissions:
+      contents: read
+      id-token: write
     needs: ci
     runs-on: ubuntu-latest
     environment: npm
@@ -53,3 +56,39 @@ jobs:
           npm publish --workspace doppelclaude --access public --tag latest
           npm publish --workspace pi-doppelclaude --access public --tag latest
           npm publish --workspace http-doppelclaude --access public --tag latest
+
+  fork-release:
+    name: Publish fork GitHub release
+    if: github.repository == 'mistrjirka/pi-doppelclaude'
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v7
+
+      - name: Set up mise
+        uses: jdx/mise-action@v5
+        with:
+          install: true
+          cache: true
+
+      - name: Prepare synchronized workspace versions
+        run: |
+          node scripts/set-release-version.mjs "${GITHUB_REF_NAME#v}"
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm ci
+
+      - name: Build complete workspace
+        run: mise run build
+
+      - name: Publish built workspace archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$(scripts/pack-built-workspace.sh "$RUNNER_TEMP")"
+          scripts/extract-release-notes.sh "$GITHUB_REF_NAME" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$GITHUB_REF_NAME" "$archive" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"

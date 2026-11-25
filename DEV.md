@@ -23,6 +23,7 @@ mise run test       # full suite: unit + integration
 mise run lint:biome                                 # TypeScript, JSON, and Markdown
 mise run typecheck
 mise run test:unit                                  # offline unit suite (tests/unit-*.ts)
+mise run test:offline-sdk                           # real SDK, localhost fixtures, fake auth
 node --import tsx --test tests/unit-models.ts       # single unit file
 node --import tsx --test tests/int-session-new.ts   # single integration file
 tests/int-smoke.sh                                  # shell-driven integration tests, run sparingly
@@ -34,6 +35,7 @@ mise run test:usage                                 # on-demand A/B subscription
 - `unit-*.ts` run offline against mocked SDK query factories.
 - `tests/fixtures/sdk-streams/` holds verbatim recorded CC message streams (scrubbed) that `unit-stream-replay.ts` replays through the real `consumeQuery`. Re-record with `node --import tsx tests/lib/record-sdk-streams.ts` on an SDK bump (costs quota), then read the fixture diff — it is the SDK's contract change. Also run `node --import tsx --test tests/int-rebuild-cache.ts` on an SDK bump: rebuilds stay warm only while they imitate how Claude Code stores and renders its context, and this fails when they stop.
 - `node --import tsx --test tests/offline-cache-compaction-sdk.ts` runs the real pinned SDK/native binary against a localhost Messages fixture, with temporary auth configuration and a fake API key. It checks exact request prefixes and cache breakpoints, preserves a pending command, verifies the full registered output allowance, and checks cache lifetime continuity. It sends no inference to Anthropic. Synthetic usage counters are not evidence of a real cache hit.
+- `tests/offline-pending-input-sdk.ts` captures the real pinned SDK request for consecutive task and recall messages through fresh turns, warm reuse, forced rebuilds, and resumed children. It verifies that one pending user turn contains both messages and no synthetic assistant closes the task. `mise run test:offline-sdk` runs both native fixtures, and `mise run check` includes them.
 - `int-*.{sh,ts}` hit the real Claude Code binary and consume real subscription quota — run deliberately. They need local Claude auth (`claude auth login`).
 - `.env.test` supplies `DOPPELCLAUDE_TESTING_ALT_PROVIDER`/`DOPPELCLAUDE_TESTING_ALT_MODEL` — an authenticated non-bridge provider used by the session-resume test.
 - `tests/int-rejection-smoke.ts` depends on the model misbehaving on request.
@@ -75,3 +77,9 @@ mise run test:usage                                 # on-demand A/B subscription
 mise run build
 pi -ne -e ./packages/pi-doppelclaude/dist/index.js -p --model doppelclaude/haiku 'Reply with exactly: bridge-ok'
 ```
+
+## Fork releases
+
+The `mistrjirka/pi-doppelclaude` fork publishes a GitHub release when a `vX.Y.Z` tag passes CI. The release includes one source archive with all three built workspaces and synchronized versions. Extract it and run `npm ci` in its root before using its Pi extension. Keep the workspaces together so Pi loads the matching fork core. `SOURCE_REVISION` records the tagged source commit.
+
+`npm publish` and the upstream GHCR image workflow run only in `thurstonsand/pi-doppelclaude`. The fork release does not publish upstream package names or container images. Use `scripts/pack-built-workspace.sh OUTPUT_DIRECTORY` after a build to check the archive locally.

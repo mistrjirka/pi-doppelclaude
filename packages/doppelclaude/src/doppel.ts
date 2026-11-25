@@ -22,6 +22,7 @@ import {
   Session,
 } from "cc-session-io";
 import { debug } from "./debug.js";
+import { type PendingInput, partitionPendingInput } from "./pending-input.js";
 import { QueryContext } from "./query-state.js";
 import type { BridgeSessionStore } from "./session-store.js";
 import { sanitizeToolId } from "./tool-names.js";
@@ -86,6 +87,8 @@ export type SyncPlan =
   | {
       path: "reuse";
       priorMessages: MessageParam[];
+      /** Count in the original native history, before pending input is merged. */
+      priorCursor: number;
       previousSession: SessionState;
       advanceCursor: boolean;
       reason: SyncReason;
@@ -93,6 +96,8 @@ export type SyncPlan =
   | {
       path: "rebuild" | "clean-start";
       priorMessages: MessageParam[];
+      /** Count in the original native history, before pending input is merged. */
+      priorCursor: number;
       previousSession: SessionState | null;
       reason: SyncReason;
     };
@@ -215,37 +220,41 @@ export function createDoppelRegistry(): DoppelRegistry {
 }
 
 /**
- * Ensure the doppel's session has all messages up to (but not including) the last user
- * message. Pure: the plan is derived before the runtime decides whether the turn is
- * pushed into a live query or spawns a new one, and derived again for a replay.
+ * Keep all pending user input out of imported history. The runtime holds the partition
+ * across retries so advancing or rebuilding a session cannot change the active prompt.
  */
 export function planSessionSync(
   messages: MessageParam[],
   currentSession: SessionState | null,
+  pendingInput: PendingInput = partitionPendingInput(messages, currentSession),
 ): SyncPlan {
-  return planFor(messages.slice(0, -1), currentSession);
+  return planFor(pendingInput.priorMessages, currentSession, pendingInput.priorCursor);
 }
 
 /**
- * The plan for a turn whose prompt is not one of pi's messages: a tool-result
- * continuation replayed after its query died. Pi has already delivered everything the
- * turn is answering, so nothing is held back and the whole history is the session's.
+ * The plan for a continuation whose tool results already belong in the transcript.
+ * A partition may remove steering messages, so retain its original history cursor.
  */
 export function planReplaySync(
   messages: MessageParam[],
   currentSession: SessionState | null,
+  priorCursor = messages.length,
 ): SyncPlan {
-  return planFor(messages, currentSession);
+  return planFor(messages, currentSession, priorCursor);
 }
 
-function planFor(priorMessages: MessageParam[], currentSession: SessionState | null): SyncPlan {
-  const reason = diagnose(priorMessages, currentSession);
+function planFor(
+  priorMessages: MessageParam[],
+  currentSession: SessionState | null,
+  priorCursor: number,
+): SyncPlan {
+  const reason = diagnose(priorMessages, currentSession, priorCursor);
   if (reason.kind === "in-sync" || reason.kind === "trailing-assistant") {
-    // Only the reuse branch proves a session exists, so the narrowing is the diagnosis'.
     if (!currentSession) throw new Error("Claude bridge: reuse diagnosed without a session");
     return {
       path: "reuse",
       priorMessages,
+      priorCursor,
       previousSession: currentSession,
       advanceCursor: reason.kind === "trailing-assistant",
       reason,
@@ -254,26 +263,31 @@ function planFor(priorMessages: MessageParam[], currentSession: SessionState | n
   return {
     path: priorMessages.length === 0 ? "clean-start" : "rebuild",
     priorMessages,
+    priorCursor,
     previousSession: currentSession,
     reason,
   };
 }
 
 /** The single place that decides a sync path, so the logged reason cannot drift from it. */
-function diagnose(priorMessages: MessageParam[], currentSession: SessionState | null): SyncReason {
+function diagnose(
+  priorMessages: MessageParam[],
+  currentSession: SessionState | null,
+  priorCursor: number,
+): SyncReason {
   if (!currentSession) return { kind: "no-session" };
   if (currentSession.rebuildReason) return { kind: "forced", cause: currentSession.rebuildReason };
-  if (priorMessages.length < currentSession.cursor)
+  if (priorCursor < currentSession.cursor)
     return {
       kind: "history-shrank",
       cursor: currentSession.cursor,
-      priors: priorMessages.length,
+      priors: priorCursor,
     };
-  const missed = priorMessages.slice(currentSession.cursor);
-  if (missed.length === 0) return { kind: "in-sync" };
-  if (missed.length === 1 && (missed[0] as { role?: string }).role === "assistant")
+  const missed = priorCursor - currentSession.cursor;
+  if (missed === 0) return { kind: "in-sync" };
+  if (missed === 1 && priorMessages.at(-1)?.role === "assistant")
     return { kind: "trailing-assistant" };
-  return { kind: "missed-messages", missed: missed.length };
+  return { kind: "missed-messages", missed };
 }
 
 /**
@@ -351,9 +365,7 @@ export function applySessionSync(input: {
   const why = describeSyncReason(plan.reason);
   if (plan.path === "reuse") {
     const previous = plan.previousSession;
-    doppel.session = plan.advanceCursor
-      ? { ...previous, cursor: plan.priorMessages.length }
-      : previous;
+    doppel.session = plan.advanceCursor ? { ...previous, cursor: plan.priorCursor } : previous;
     debug(
       `Case 3: doppel=${doppel.label} ${plan.advanceCursor ? "advanced cursor past trailing assistant, " : ""}resuming session ${previous.sessionId.slice(0, 8)}, cursor=${doppel.session.cursor}`,
     );
@@ -363,9 +375,7 @@ export function applySessionSync(input: {
     return { sessionId: previous.sessionId, path: "reuse", rebuild: null };
   }
   if (plan.path === "clean-start") {
-    debug(
-      `Case 1: doppel=${doppel.label} clean start, ${plan.priorMessages.length + 1} total messages`,
-    );
+    debug(`Case 1: doppel=${doppel.label} clean start, no completed history`);
     debug(`syncResult: path=clean-start doppel=${doppel.label} reason=${why}`);
     return { sessionId: null, path: "clean-start", rebuild: null };
   }
@@ -389,7 +399,7 @@ export function applySessionSync(input: {
     );
     if (recovered) {
       sessionStore.replace(previousSessionId, recovered);
-      doppel.session = { sessionId: previousSessionId, cursor: plan.priorMessages.length };
+      doppel.session = { sessionId: previousSessionId, cursor: plan.priorCursor };
       debug(
         `syncResult: path=rebuild doppel=${doppel.label} reason=${why} ` +
           `cache-preserving tool-result append, kept=${ownTranscript.length} records`,
@@ -423,13 +433,13 @@ export function applySessionSync(input: {
     source ? turnBoundaries(source) : [],
   );
   sessionStore.replace(session.sessionId, session.records);
-  doppel.session = { sessionId: session.sessionId, cursor: plan.priorMessages.length };
+  doppel.session = { sessionId: session.sessionId, cursor: plan.priorCursor };
   if (previousSessionId === undefined) {
     debug(
       `Case 2: doppel=${doppel.label} first turn with ${plan.priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`,
     );
   } else {
-    const missedCount = plan.priorMessages.length - previousCursor;
+    const missedCount = plan.priorCursor - previousCursor;
     debug(
       `Case 4: doppel=${doppel.label} ${missedCount} missed messages, ${plan.priorMessages.length} total → replaced session ${session.sessionId.slice(0, 8)} (same id), ${session.records.length} records`,
     );

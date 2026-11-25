@@ -272,6 +272,29 @@ async function deliverToolResult(
 }
 
 describe("dead query retry", () => {
+  it("keeps all pending user messages together when a fresh query retries", async () => {
+    const { runtime, spawned } = makeHarness([
+      { stayOpen: true },
+      { messages: [...textEvents("alive"), successResult] },
+    ]);
+    const turn = record(
+      stream(runtime, [...prompt, { role: "user", content: "Historical project notes" }]),
+    );
+    await until(() => spawned[0]?.prompts.length === 1, "the complete pending input to be sent");
+    spawned[0].fail(QUERY_CLOSED);
+    await turn.done;
+    assert.equal(spawned.length, 2);
+    const expected = [
+      { type: "text", text: "go" },
+      { type: "text", text: "Historical project notes" },
+    ];
+    assert.deepEqual(
+      spawned.map((query) => query.prompts[0]?.message.content),
+      [expected, expected],
+    );
+    assert.deepEqual(texts(turn.events), ["alive"]);
+  });
+
   it("replays the turn once on a fresh subprocess and answers from it", async () => {
     const { runtime, spawned } = makeHarness([
       { failInit: QUERY_CLOSED },
@@ -372,7 +395,15 @@ describe("dead query retry", () => {
 
   it("recovers when Claude reports OAuth revocation without the HTTP status", async () => {
     const { runtime, spawned } = makeHarness([
-      { messages: [{ ...revokedResult, error: "Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator." } as SDKMessage] },
+      {
+        messages: [
+          {
+            ...revokedResult,
+            error:
+              "Failed to authenticate: OAuth token revoked. Please log in again or contact your administrator.",
+          } as SDKMessage,
+        ],
+      },
       { messages: [...textEvents("refreshed"), successResult] },
     ]);
     const turn = record(stream(runtime, prompt));
@@ -428,10 +459,18 @@ describe("dead query retry", () => {
 
     // The tool set changed, so the reused query is asked to reconcile its MCP servers —
     // and answers as a corpse.
-    const second = record(stream(runtime, secondPrompt, undefined, [bashTool]));
+    const second = record(
+      stream(runtime, [...secondPrompt, { role: "user", content: "Warm recall" }], undefined, [
+        bashTool,
+      ]),
+    );
     await second.done;
 
     assert.equal(spawned.length, 2, "the pushed-into corpse was not replaced");
+    assert.deepEqual(spawned[1].prompts[0]?.message.content, [
+      { type: "text", text: "again" },
+      { type: "text", text: "Warm recall" },
+    ]);
     assert.deepEqual(texts(second.events), ["second"]);
     assert.equal(terminalError(second.events), null);
   });
@@ -521,14 +560,19 @@ describe("dead query retry", () => {
     const continuation = await deliverToolResult(runtime, [
       ...toolTurn,
       { role: "user", content: STEERING },
+      { role: "user", content: "Steering recall" },
     ]);
     await until(
       () => spawned[0].prompts.length === 2,
       "the steering to be queued behind the tool result",
     );
-    assert.equal(
-      String(spawned[0].prompts.at(-1)?.message.content),
-      STEERING,
+    const expected = [
+      { type: "text", text: STEERING },
+      { type: "text", text: "Steering recall" },
+    ];
+    assert.deepEqual(
+      spawned[0].prompts.at(-1)?.message.content,
+      expected,
       "the steering never reached the warm query",
     );
 
@@ -536,9 +580,9 @@ describe("dead query retry", () => {
     await continuation.done;
 
     assert.equal(spawned.length, 2, "the dead continuation was not respawned");
-    assert.equal(
-      String(spawned[1].prompts[0]?.message.content),
-      STEERING,
+    assert.deepEqual(
+      spawned[1].prompts[0]?.message.content,
+      expected,
       "steering died in the corpse's queue, so the replay must prompt with it instead of the tool-result nudge",
     );
     assert.deepEqual(texts(continuation.events), ["log checked"]);
@@ -547,6 +591,27 @@ describe("dead query retry", () => {
       "done",
       "the replay's answer did not complete the turn",
     );
+  });
+
+  it("does not import an in-flight task before a reentrant recall message", async () => {
+    const { runtime, spawned } = makeHarness([
+      { stayOpen: true },
+      { messages: [...textEvents("child answered"), successResult] },
+    ]);
+    record(stream(runtime, prompt));
+    await until(() => spawned[0]?.prompts.length === 1, "the primary task to be sent");
+    runtime.test.setHostSession({ sessionId: "11111111-1111-4111-8111-111111111111", cursor: 1 });
+    const nested = record(
+      stream(runtime, [...prompt, { role: "user", content: "Reentrant recall" }]),
+    );
+    await nested.done;
+    assert.equal(spawned.length, 2);
+    assert.deepEqual(spawned[1].prompts[0]?.message.content, [
+      { type: "text", text: "go" },
+      { type: "text", text: "Reentrant recall" },
+    ]);
+    assert.deepEqual(texts(nested.events), ["child answered"]);
+    await runtime.clear("test complete");
   });
 
   it("replays a reentrant query's continuation as another one-shot", async () => {
@@ -561,9 +626,14 @@ describe("dead query retry", () => {
     await until(() => spawned[0]?.prompts.length === 1, "the host's turn to reach a live query");
     // A turn arriving while the doppel's query is mid-flight gets a context of its own,
     // and a query that is a one-shot however it ends.
-    const nested = record(stream(runtime, secondPrompt, undefined, [bashTool]));
+    const nestedPrompt = [...secondPrompt, { role: "user", content: "Child recall" }];
+    const nested = record(stream(runtime, nestedPrompt, undefined, [bashTool]));
     await nested.done;
     assert.equal(spawned.length, 2, "the reentrant turn did not get its own query");
+    assert.deepEqual(spawned[1].prompts[0]?.message.content, [
+      { type: "text", text: "again" },
+      { type: "text", text: "Child recall" },
+    ]);
     assert.equal(
       nested.events.at(-1)?.type,
       "done",
@@ -571,7 +641,7 @@ describe("dead query retry", () => {
     );
 
     const continuation = record(
-      stream(runtime, answeredToolCall(secondPrompt), undefined, [bashTool]),
+      stream(runtime, answeredToolCall(nestedPrompt), undefined, [bashTool]),
     );
     spawned[1].fail(REVOKED);
     await until(() => spawned[2]?.promptsEnded === true, "the replay to be prompted and closed");

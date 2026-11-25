@@ -89,10 +89,15 @@ run = "set -a && [ -f .env.test ] && . ./.env.test; set +a && mise run test:unit
 description = "Run the offline unit tests"
 run = "mise run build && node --import tsx --test tests/unit-*.ts"
 
+[tasks."test:offline-sdk"]
+description = "Run the pinned native SDK against isolated localhost fixtures"
+depends = ["build"]
+run = "node --import tsx --test tests/offline-*-sdk.ts"
+
 [tasks."test:usage"]
 description = "On-demand subscription-usage diagnostic (rate-limited endpoint)"
 run = "node --import tsx tests/usage-test.ts"
 
 [tasks.check]
 description = "Run offline verification (integration tests via `mise run test` hit live APIs)"
-depends = ["lint", "typecheck", "test:unit"]
+depends = ["lint", "typecheck", "test:unit", "test:offline-sdk"]

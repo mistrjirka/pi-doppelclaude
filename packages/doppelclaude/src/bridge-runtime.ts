@@ -57,6 +57,7 @@ import {
 } from "./doppel.js";
 import { errorMessage } from "./errors.js";
 import type { McpContent, McpResult } from "./extract-tool-results.js";
+import { type PendingInput, partitionPendingInput } from "./pending-input.js";
 import { createProviderStreamRuntime } from "./provider-stream.js";
 import { PushQueue, type QueryContext } from "./query-state.js";
 import type { RefusalEntryData } from "./refusal-data.js";
@@ -316,37 +317,6 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     return results;
   }
 
-  /** Extract the last user message from context as a prompt string. Returns null if last message is not a user message. */
-  function extractUserPrompt(messages: MessageParam[]): string | null {
-    const last = messages[messages.length - 1];
-    if (last?.role !== "user") return null;
-    if (typeof last.content === "string") return last.content;
-    if (!Array.isArray(last.content)) return "";
-    return last.content
-      .filter((block) => block.type === "text")
-      .map((block) => block.text)
-      .join("\n");
-  }
-
-  /** Keep structured user content intact; tool results travel through MCP or transcript replay. */
-  function extractUserPromptBlocks(messages: MessageParam[]): ContentBlockParam[] | null {
-    const last = messages[messages.length - 1];
-    if (last?.role !== "user") return null;
-    if (typeof last.content === "string") {
-      debug(`extractUserPromptBlocks: content is string (length=${last.content.length})`);
-      return null;
-    }
-    if (!Array.isArray(last.content)) {
-      debug(`extractUserPromptBlocks: content is ${typeof last.content}`);
-      return null;
-    }
-    debug(
-      `extractUserPromptBlocks: ${last.content.length} blocks, types=${last.content.map((b) => b.type).join(",")}`,
-    );
-    const blocks = last.content.filter((block) => block.type !== "tool_result");
-    return blocks.length ? blocks : null;
-  }
-
   function sdkPrompt(content: string | ContentBlockParam[]): SDKUserMessage {
     return {
       type: "user",
@@ -356,24 +326,26 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     };
   }
 
-  function sdkUserMessage(messages: MessageParam[]): SDKUserMessage {
-    const blocks = extractUserPromptBlocks(messages);
-    const text = extractUserPrompt(messages);
-    if (!blocks && !text) {
+  function sdkUserMessage(input: PendingInput, messages: MessageParam[]): SDKUserMessage {
+    if (input.promptContent === null) {
       diagDump("empty_prompt", {
         contextLength: messages.length,
         lastMsgRole: messages.at(-1)?.role,
         messageRoles: messages.map((message, index) => `[${index}]${message.role}`).join(" "),
       });
     }
-    return sdkPrompt(blocks ?? text ?? "[continue]");
+    return sdkPrompt(input.promptContent ?? "[continue]");
   }
 
-  function contextForToolResults(results: McpResult[]): QueryContext | undefined {
+  function contextForToolResults(
+    results: McpResult[],
+    conversationKey: string | undefined,
+  ): QueryContext | undefined {
     for (const result of results) {
       const id = result.toolCallId;
       if (!id) continue;
       for (const queryCtx of activeQueryContexts) {
+        if (conversationKey !== undefined && queryCtx.doppel.key !== conversationKey) continue;
         if (
           queryCtx.hasPendingToolCall(id) ||
           queryCtx.pendingResults.has(id) ||
@@ -1077,13 +1049,6 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
     const mainRequest = request;
     const nativeCursor = nativeMessages.length;
     const lastMsg = nativeMessages.at(-1);
-    const lastUserBlocks =
-      lastMsg?.role === "user" && Array.isArray(lastMsg.content) ? lastMsg.content : [];
-    const lastHasToolResult = lastUserBlocks.some((block) => block.type === "tool_result");
-    const lastHasUserInput =
-      lastMsg?.role === "user" &&
-      (typeof lastMsg.content === "string" ||
-        lastUserBlocks.some((block) => block.type !== "tool_result"));
     // MCP cannot carry native document/search blocks or URL/file images. Import the entire
     // tail instead of discarding them or inventing a lossy text/resource representation.
     let replayToolContent = false;
@@ -1248,22 +1213,39 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
       });
     }
 
-    const allResults =
-      !replayToolContent && activeQueryContexts.size > 0
-        ? extractAllToolResults(nativeMessages)
-        : [];
-    const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
+    const allResults = activeQueryContexts.size > 0 ? extractAllToolResults(nativeMessages) : [];
+    const resultCtx =
+      allResults.length > 0
+        ? contextForToolResults(allResults, request.conversationKey)
+        : undefined;
+    if (resultCtx?.fatalError) {
+      resultCtx.beginCommand(model, native);
+      claimCurrentResponse(resultCtx.currentResponse, "tool-result-error", resultCtx);
+      resultCtx.observeCommandUsage = dependencies.observeCommandUsage;
+      emitTerminalError(resultCtx, "error", resultCtx.fatalError);
+      // Claude Code is still waiting on these results; answering them would be its next request.
+      discardQuery(resultCtx, resultCtx.fatalError, "rebuild");
+      return stream;
+    }
+    const doppel = resultCtx?.doppel ?? doppels.resolve(request.conversationKey);
+    // Compute this before any sync or tool-result delivery advances the native cursor.
+    // Every retry of this command must send the same complete pending input.
+    // A reentrant query is a separate reader. Input accepted by the busy primary
+    // query is not completed history for it, even if that query already has a session id.
+    const reentrantInput = Boolean(
+      !resultCtx && doppel.context.activeQuery && !doppel.context.readyForInput,
+    );
+    const pendingInput = partitionPendingInput(
+      nativeMessages,
+      reentrantInput ? null : doppel.session,
+    );
+    const hasUserInput = pendingInput.promptContent !== null;
+    const hasToolResult = pendingInput.hasToolResults;
+    // One-shot children have a closed prompt queue. Replay their results and new input
+    // together instead of dropping steering that cannot be pushed into that queue.
+    const replayPendingInput = Boolean(resultCtx && !resultCtx.persistent && hasUserInput);
 
-    if (resultCtx) {
-      if (resultCtx.fatalError) {
-        resultCtx.beginCommand(model, native);
-        claimCurrentResponse(resultCtx.currentResponse, "tool-result-error", resultCtx);
-        resultCtx.observeCommandUsage = dependencies.observeCommandUsage;
-        emitTerminalError(resultCtx, "error", resultCtx.fatalError);
-        // Claude Code is still waiting on these results; answering them would be its next request.
-        discardQuery(resultCtx, resultCtx.fatalError, "rebuild");
-        return stream;
-      }
+    if (resultCtx && !replayToolContent && !replayPendingInput) {
       resultCtx.activeModel = model;
       resultCtx.resetTurnState(model, native);
       claimCurrentResponse(resultCtx.currentResponse, "tool-result", resultCtx);
@@ -1288,23 +1270,8 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
               const queryCtx = resultCtx;
               const doppel = queryCtx.doppel;
               const persistent = doppel.kind === "host" && queryCtx === doppel.context;
-              // A trailing user message is steering pi has not handed to Claude Code yet, so it
-              // is the replay's prompt; otherwise the history ends at the results and the replay
-              // only asks the fresh subprocess to carry on.
-              const steering = lastHasUserInput;
-              const replayHistory = steering
-                ? [
-                    ...nativeMessages.slice(0, -1),
-                    ...(lastHasToolResult
-                      ? [
-                          {
-                            role: "user" as const,
-                            content: lastUserBlocks.filter((block) => block.type === "tool_result"),
-                          },
-                        ]
-                      : []),
-                  ]
-                : nativeMessages;
+              const steering = hasUserInput;
+              const replayHistory = pendingInput.priorMessages;
               debug(
                 `provider: replaying the tool-result continuation on a fresh subprocess (doppel=${doppel.label}, ${allResults.length} result(s) already in pi's history, prompt=${steering ? "steering" : "replay"}, persistent=${persistent})`,
               );
@@ -1315,23 +1282,23 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
               spawnTurn({
                 queryCtx,
                 freshTurn: planFreshTurn(queryCtx, persistent),
-                syncPlan: planReplaySync(replayHistory, doppel.session),
-                promptMessage: steering ? sdkUserMessage(nativeMessages) : sdkPrompt(REPLAY_PROMPT),
+                syncPlan: planReplaySync(replayHistory, doppel.session, pendingInput.priorCursor),
+                promptMessage: steering
+                  ? sdkUserMessage(pendingInput, nativeMessages)
+                  : sdkPrompt(REPLAY_PROMPT),
                 persistent,
                 drainExisting: false,
                 trigger: "continuation_replay",
               });
             };
 
-      if (lastHasUserInput) {
-        if (resultCtx.persistent && resultCtx.inputQueue) {
-          resultCtx.inputQueue.push(sdkUserMessage(nativeMessages));
-          debug(
-            `provider: queued native steering message: ${extractUserPrompt(nativeMessages)?.slice(0, 60) ?? "[image]"}`,
-          );
-        } else {
-          debug("provider: ignored steering for a one-shot query");
+      if (hasUserInput) {
+        if (!resultCtx.inputQueue) {
+          failReconciliation(resultCtx, "Claude bridge: steering has no active input queue");
+          return stream;
         }
+        resultCtx.inputQueue.push(sdkUserMessage(pendingInput, nativeMessages));
+        debug(`provider: queued ${pendingInput.pendingMessageCount} native steering message(s)`);
       }
 
       // Reconciled against what the client had been shown before this request, and before the
@@ -1410,10 +1377,9 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
       return stream;
     }
 
-    if (replayToolContent || (lastHasToolResult && request.explicitReplay)) {
-      const doppel = doppels.resolve(request.conversationKey);
-      const replayCtx = doppel.context;
-      const persistent = doppel.kind === "host";
+    if (replayToolContent || replayPendingInput || (hasToolResult && request.explicitReplay)) {
+      const replayCtx = resultCtx ?? doppel.context;
+      const persistent = doppel.kind === "host" && replayCtx === doppel.context;
       replayCtx.activeModel = model;
       replayCtx.beginCommand(model, native);
       claimCurrentResponse(replayCtx.currentResponse, "explicit-tool-result-replay", replayCtx);
@@ -1424,18 +1390,27 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
       spawnTurn({
         queryCtx: replayCtx,
         freshTurn: planFreshTurn(replayCtx, persistent),
-        syncPlan: planReplaySync(nativeMessages, doppel.session),
-        promptMessage: sdkPrompt(REPLAY_PROMPT),
+        syncPlan: planReplaySync(
+          pendingInput.priorMessages,
+          doppel.session,
+          pendingInput.priorCursor,
+        ),
+        promptMessage: hasUserInput
+          ? sdkUserMessage(pendingInput, nativeMessages)
+          : sdkPrompt(REPLAY_PROMPT),
         persistent,
-        drainExisting: !replayToolContent && Boolean(replayCtx.activeQuery),
-        trigger: replayToolContent ? "rich_content_replay" : "explicit_replay",
+        drainExisting: !resultCtx && !replayToolContent && Boolean(replayCtx.activeQuery),
+        trigger: replayToolContent
+          ? "rich_content_replay"
+          : replayPendingInput
+            ? "continuation_replay"
+            : "explicit_replay",
       });
       return stream;
     }
 
-    if (lastHasToolResult && !lastHasUserInput) {
+    if (hasToolResult && !hasUserInput) {
       debug("provider: orphaned tool result after abort, emitting end_turn");
-      const doppel = doppels.resolve(request.conversationKey);
       const orphanCtx = doppel.context;
       if (doppel.session) doppel.session.cursor = nativeCursor;
       if (orphanCtx.fatalError) {
@@ -1466,15 +1441,14 @@ export function createBridgeRuntime(dependencies: BridgeRuntimeDependencies = {}
       // Caller identity decides whose conversation this is: the doppel it addresses owns
       // the session, the query and the failures of every turn it runs, and can reach no
       // other doppel's. Only the host's query stays warm between turns.
-      const doppel = doppels.resolve(request.conversationKey);
       const primary = doppel.context;
       const warmQuery = Boolean(primary.activeQuery && primary.persistent && primary.readyForInput);
       // Reentrancy proper: a turn arrived while this doppel's query is mid-flight.
       const isReentrant = Boolean(primary.activeQuery && !warmQuery);
       const queryCtx = isReentrant ? doppel.spawnContext() : primary;
       const persistent = !isReentrant && doppel.kind === "host";
-      const syncPlan = planSessionSync(nativeMessages, doppel.session);
-      const promptMessage = sdkUserMessage(nativeMessages);
+      const syncPlan = planSessionSync(nativeMessages, doppel.session, pendingInput);
+      const promptMessage = sdkUserMessage(pendingInput, nativeMessages);
       const freshTurn = planFreshTurn(queryCtx, persistent);
 
       const canPush = Boolean(

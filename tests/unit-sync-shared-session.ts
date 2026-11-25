@@ -72,6 +72,7 @@ describe("session sync planning", () => {
     const plan = planSessionSync(
       [
         { role: "user", content: "first" },
+        { role: "assistant", content: "previous answer" },
         { role: "user", content: "next" },
       ] as MessageParam[],
       {
@@ -88,12 +89,13 @@ describe("session sync planning", () => {
     const plan = planSessionSync(
       [
         { role: "user", content: "first" },
+        { role: "assistant", content: "previous answer" },
         { role: "user", content: "next" },
       ] as MessageParam[],
       { sessionId: "11111111-1111-4111-8111-111111111111", cursor: 42 },
     );
     assert.equal(plan.path, "rebuild");
-    assert.equal(describeSyncReason(plan.reason), "history-shrank(cursor=42 priors=1)");
+    assert.equal(describeSyncReason(plan.reason), "history-shrank(cursor=42 priors=2)");
   });
 
   it("rebuilds into the store without writing Claude's project directory", () => {

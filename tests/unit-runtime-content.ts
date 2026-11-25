@@ -197,10 +197,10 @@ function harness(toolTurn = false, failAfterResult = false) {
     get closes() {
       return closes;
     },
-    turn(messages: MessageParam[]) {
+    turn(messages: MessageParam[], conversationKey = "test") {
       return collect(
         runtime.turn({
-          conversationKey: "test",
+          conversationKey,
           model: "claude-haiku-4-5",
           cwd: process.cwd(),
           messages,
@@ -212,6 +212,171 @@ function harness(toolTurn = false, failAfterResult = false) {
 }
 
 describe("native SDK content delivery", () => {
+  it("keeps colliding guest result ids out of the host query during rich replay", async () => {
+    const app = harness(true);
+    await app.runtime.designateHost("test");
+    try {
+      await app.turn([{ role: "user", content: "Host task" }]);
+      const hostQuery = app.runtime.test.hostContext.activeQuery;
+      assert.ok(hostQuery);
+      const guest: MessageParam[] = [
+        { role: "user", content: "Guest task" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "read_pdf", name: "read", input: {} }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "read_pdf", content: [document] }],
+        },
+        { role: "user", content: "Guest steering" },
+        { role: "user", content: "Guest recall" },
+      ];
+      await app.turn(guest, "guest");
+      assert.equal(app.runtime.test.hostContext.activeQuery, hostQuery);
+      assert.equal(app.runtime.test.hostContext.hasPendingToolCall("read_pdf"), true);
+      assert.equal(app.runtime.test.doppels.resolve("guest").session?.cursor, guest.length);
+    } finally {
+      await app.runtime.clear("test complete");
+    }
+  });
+
+  it("does not replay a fatal query when rich results carry pending input", async () => {
+    const app = harness(true);
+    await app.runtime.designateHost("test");
+    try {
+      await app.turn([{ role: "user", content: "Host task" }]);
+      app.runtime.test.hostContext.fatalError = "Non-retryable bridge failure";
+      const events: CoreResponseEvent[] = [];
+      for await (const event of app.runtime.turn({
+        conversationKey: "test",
+        model: "claude-haiku-4-5",
+        cwd: process.cwd(),
+        messages: [
+          { role: "user", content: "Host task" },
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "read_pdf", name: "read", input: {} }],
+          },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "read_pdf", content: [document] }],
+          },
+          { role: "user", content: "Pending recall" },
+        ],
+      }))
+        events.push(event);
+      assert.equal(app.spawns, 1);
+      assert.ok(events.some((event) => event.type === "terminal_error"));
+    } finally {
+      await app.runtime.clear("test complete");
+    }
+  });
+
+  it("sends task, attachments and recall together on fresh and warm turns", async () => {
+    const app = harness();
+    await app.runtime.designateHost("test");
+    const first: MessageParam[] = [
+      { role: "user", content: "Complete the active assignment" },
+      { role: "user", content: blocks },
+      { role: "user", content: "Historical project notes" },
+    ];
+    const before = structuredClone(first);
+    try {
+      await app.turn(first);
+      assert.deepEqual(app.prompts[0].message.content, [
+        { type: "text", text: "Complete the active assignment" },
+        ...blocks,
+        { type: "text", text: "Historical project notes" },
+      ]);
+      assert.equal(app.transcripts.length, 0, "the active task must not become imported history");
+      assert.equal(app.runtime.test.getHostSession()?.cursor, first.length);
+      const next: MessageParam[] = [
+        ...first,
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Complete the next assignment" },
+        { role: "user", content: "More historical notes" },
+      ];
+      await app.turn(next);
+      assert.equal(app.spawns, 1, "grouping must keep the warm query reusable");
+      assert.deepEqual(app.prompts[1].message.content, [
+        { type: "text", text: "Complete the next assignment" },
+        { type: "text", text: "More historical notes" },
+      ]);
+      assert.equal(app.runtime.test.getHostSession()?.cursor, next.length);
+      assert.deepEqual(first, before);
+    } finally {
+      await app.runtime.clear("test complete");
+    }
+  });
+
+  it("groups guest input again when its next turn resumes a closed query", async () => {
+    const app = harness();
+    const first: MessageParam[] = [
+      { role: "user", content: "Child assignment" },
+      { role: "user", content: "Child recall" },
+    ];
+    try {
+      await app.turn(first);
+      const next: MessageParam[] = [
+        ...first,
+        { role: "assistant", content: "done" },
+        { role: "user", content: "Next child assignment" },
+        { role: "user", content: "Next child recall" },
+      ];
+      await app.turn(next);
+      assert.equal(app.spawns, 2);
+      assert.deepEqual(app.prompts[1].message.content, [
+        { type: "text", text: "Next child assignment" },
+        { type: "text", text: "Next child recall" },
+      ]);
+      assert.equal(app.runtime.test.doppels.resolve("test").session?.cursor, next.length);
+    } finally {
+      await app.runtime.clear("test complete");
+    }
+  });
+
+  it("replays one-shot child results with every steering message", {
+    timeout: 10_000,
+  }, async () => {
+    const app = harness(true);
+    try {
+      await app.turn([{ role: "user", content: "Read the file" }]);
+      const messages: MessageParam[] = [
+        { role: "user", content: "Read the file" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "read_pdf", name: "read", input: { path: "report.pdf" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "read_pdf", content: "File contents" },
+            { type: "text", text: "Use this result" },
+          ],
+        },
+        { role: "user", content: "Historical recall" },
+      ];
+      await app.turn(messages);
+      assert.equal(app.spawns, 2);
+      assert.deepEqual(app.prompts.at(-1)?.message.content, [
+        { type: "text", text: "Use this result" },
+        { type: "text", text: "Historical recall" },
+      ]);
+      const imported = app.transcripts.at(-1)?.filter((entry) => entry.type === "user");
+      const importedResult = imported?.at(-1)?.message;
+      assert.ok(importedResult);
+      assert.deepEqual((importedResult as MessageParam).content, [
+        { type: "tool_result", tool_use_id: "read_pdf", content: "File contents" },
+      ]);
+      assert.equal(app.runtime.test.doppels.resolve("test").session?.cursor, messages.length);
+    } finally {
+      await app.runtime.clear("test complete");
+    }
+  });
+
   it("preserves structured content on fresh and warm SDK prompts", async () => {
     const app = harness();
     await app.runtime.designateHost("test");
@@ -289,7 +454,7 @@ describe("native SDK content delivery", () => {
   });
 
   for (const warm of [false, true]) {
-    for (const steering of ["none", "mixed", "split"]) {
+    for (const steering of ["none", "mixed", "split", "split-many"]) {
       it(`imports complete ${warm ? "warm" : "cold"} tool results with ${steering} steering`, async () => {
         const app = harness(warm);
         await app.runtime.designateHost("test");
@@ -320,8 +485,11 @@ describe("native SDK content delivery", () => {
                   : []),
               ],
             },
-            ...(steering === "split"
+            ...(steering === "split" || steering === "split-many"
               ? [{ role: "user" as const, content: "Focus on page two" }]
+              : []),
+            ...(steering === "split-many"
+              ? [{ role: "user" as const, content: "Historical project notes" }]
               : []),
           ];
           await app.turn(messages);
@@ -334,18 +502,30 @@ describe("native SDK content delivery", () => {
               const message = entry.message as MessageParam;
               return { role: message.role, content: message.content };
             });
-          const expected =
-            steering === "mixed"
-              ? [
-                  ...messages.slice(0, 2),
-                  {
-                    role: "user",
-                    content: [{ type: "tool_result", tool_use_id: "read_pdf", content: blocks }],
-                  },
-                  { role: "user", content: [{ type: "text", text: "Focus on page two" }] },
-                ]
-              : messages;
-          assert.deepEqual(imported, expected);
+          assert.deepEqual(imported, [
+            ...messages.slice(0, 2),
+            {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "read_pdf", content: blocks }],
+            },
+          ]);
+          const activePrompt = app.prompts.at(-1)?.message.content;
+          if (steering === "none") {
+            assert.match(String(activePrompt), /Continue the pending task/);
+          } else {
+            assert.deepEqual(
+              activePrompt,
+              steering === "split"
+                ? "Focus on page two"
+                : [
+                    { type: "text", text: "Focus on page two" },
+                    ...(steering === "split-many"
+                      ? [{ type: "text", text: "Historical project notes" }]
+                      : []),
+                  ],
+            );
+          }
+          assert.equal(app.runtime.test.getHostSession()?.cursor, messages.length);
           await app.turn([
             ...messages,
             { role: "assistant", content: [{ type: "text", text: "done" }] },
