@@ -1,0 +1,7 @@
+[Unit]
+Description=Check and renew Claude Code authentication using the official CLI
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/claude-auth-check
+TimeoutStartSec=60

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Claude Code authentication every five minutes
+
+[Timer]
+OnStartupSec=30s
+OnUnitActiveSec=5min
+AccuracySec=10s
+Unit=claude-auth-check.service
+
+[Install]
+WantedBy=timers.target

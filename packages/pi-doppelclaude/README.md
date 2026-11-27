@@ -46,6 +46,30 @@ Yes, Anthropic locked down their subscription from use in other harnesses. The w
 
 Even then, if you try to use the Agent SDK in pi, Anthropic detects pi's system prompt and blocks the request. So I figured out exactly which part of the prompt Anthropic was matching on, and exposed hooks for you to replace them with a different snippet. I'm not hard-coding this into the project because that would theoretically just be another thing for Anthropic to try to match on. Write your own prose. Any prose, as long as it's only yours.
 
+## Optional Linux authentication check
+
+If Claude Agent SDK requests fail after the Claude Code access token expires, but
+opening Claude Code restores authentication, the fork includes an optional systemd
+user timer. From the repository root, with Claude Code and `jq` installed:
+
+```bash
+./scripts/install-claude-auth-check.sh
+```
+
+The timer calls the official `claude auth status --json` command every five minutes.
+It makes no inference requests and does not read or write OAuth tokens itself.
+The installed CLI owns renewal. The timer runs while the systemd user manager is
+active. It cannot restore a revoked or expired login that requires interactive sign-in,
+and it does not guarantee that an already-running SDK process reloads credentials.
+It uses the default Claude Code profile, not an externally supplied OAuth token.
+If Claude Code is installed outside the user service's PATH, configure that service's
+PATH before installing. For diagnostics or to disable it:
+
+```bash
+journalctl --user -u claude-auth-check.service
+systemctl --user disable --now claude-auth-check.timer
+```
+
 ## Configuration
 
 Configuration lives under the `doppelclaude` key in pi's global settings at `~/.pi/agent/settings.json`.
